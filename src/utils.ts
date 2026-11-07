@@ -113,8 +113,8 @@ let premultiplyRGB = true;
  * RGB components should not be premultiplied when using Canvas renderer
  * @param mode  Renderer mode
  */
-export function setPremultiplyMode(mode: 'webgl' | 'canvas'): void {
-  premultiplyRGB = mode === 'webgl';
+export function setPremultiplyMode(mode: 'webgl' | 'canvas' | 'webgpu'): void {
+  premultiplyRGB = mode !== 'canvas';
 }
 
 /**

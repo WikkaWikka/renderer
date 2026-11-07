@@ -461,9 +461,9 @@ export class Stage {
         (fontEngine: TextRenderer) => {
           const type = fontEngine.type;
 
-          if (type === 'sdf' && renderMode === 'canvas') {
+          if (type === 'sdf' && renderMode !== 'webgl') {
             console.warn(
-              'MsdfTextRenderer is not compatible with Canvas renderer. Skipping...',
+              'SdfTextRenderer is only compatible with the WebGL renderer. Skipping...',
             );
             return false;
           }
@@ -502,9 +502,9 @@ export class Stage {
       const type = fontEngine.type;
 
       // Check compatibility
-      if (type === 'sdf' && renderMode === 'canvas') {
+      if (type === 'sdf' && renderMode !== 'webgl') {
         console.warn(
-          'MsdfTextRenderer is not compatible with Canvas renderer. Skipping...',
+          'SdfTextRenderer is only compatible with the WebGL renderer. Skipping...',
         );
       } else {
         if (type === 'canvas') {

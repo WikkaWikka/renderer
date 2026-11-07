@@ -25,6 +25,10 @@ import {
 } from '@lightningjs/renderer';
 import { WebGlRenderer, SdfTextRenderer } from '@lightningjs/renderer/webgl';
 import {
+  WebGpuRenderer,
+  requestWebGpuDevice,
+} from '@lightningjs/renderer/webgpu';
+import {
   CanvasRenderer,
   CanvasTextRenderer,
 } from '@lightningjs/renderer/canvas';
@@ -87,6 +91,11 @@ const platformMap = {
 (async () => {
   // See README.md for details on the supported URL params
   const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('app') === 'blits-webgpu') {
+    await import('./blits-webgpu.js');
+    return;
+  }
+
   const automation = urlParams.get('automation') === 'true';
   /**
    * In automation mode this is a wildcard string of tests to run.
@@ -111,7 +120,11 @@ const platformMap = {
   const logicalPixelRatio = resolution / appHeight;
 
   let renderMode = urlParams.get('renderMode');
-  if (renderMode !== 'webgl' && renderMode !== 'canvas') {
+  if (
+    renderMode !== 'webgl' &&
+    renderMode !== 'canvas' &&
+    renderMode !== 'webgpu'
+  ) {
     renderMode = 'webgl';
   }
 
@@ -264,6 +277,8 @@ async function initRenderer(
 ) {
   let inspector: typeof Inspector | undefined;
   if (enableInspector) inspector = Inspector;
+  const webGpuDevice =
+    renderMode === 'webgpu' ? await requestWebGpuDevice() : null;
   const renderer = new RendererMain(
     {
       appWidth,
@@ -277,14 +292,25 @@ async function initRenderer(
       forceWebGL2,
       inspector,
       platform: platformMap[platform] || WebPlatform,
-      renderEngine: renderMode === 'webgl' ? WebGlRenderer : CanvasRenderer,
-      fontEngines: [SdfTextRenderer, CanvasTextRenderer],
+      renderEngine:
+        renderMode === 'webgl'
+          ? WebGlRenderer
+          : renderMode === 'webgpu'
+            ? WebGpuRenderer
+            : CanvasRenderer,
+      webGpuDevice,
+      fontEngines:
+        renderMode === 'webgpu'
+          ? [CanvasTextRenderer]
+          : [SdfTextRenderer, CanvasTextRenderer],
       textureProcessingTimeLimit: textureProcessingTimeLimit,
       ...customSettings,
     },
     'app',
   );
-  await installShaders(renderer.stage, renderMode);
+  if (renderMode !== 'webgpu') {
+    await installShaders(renderer.stage, renderMode);
+  }
   await installFonts(renderer.stage, preloadFonts);
 
   /**
