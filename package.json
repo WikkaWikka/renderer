@@ -32,7 +32,7 @@
     "lint:eslint": "eslint .",
     "lint:fix:eslint": "eslint --fix .",
     "typedoc": "typedoc",
-    "prepare": "npm run build && husky install",
+    "prepare": "tsc --build tsconfig.dist.json && husky install",
     "prepack": "pnpm run build",
     "node-version": "node --version"
   },
