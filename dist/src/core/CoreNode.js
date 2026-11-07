@@ -1,0 +1,2043 @@
+/*
+ * If not stated otherwise in this file or this component's LICENSE file the
+ * following copyright and licenses apply:
+ *
+ * Copyright 2023 Comcast Cable Communications Management, LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import { assertTruthy, getNewId, mergeColorAlphaPremultiplied, } from '../utils.js';
+import { QUAD_VERTEX_STRIDE, } from './renderers/webgl/internal/BufferCollection.js';
+import {} from './textures/Texture.js';
+import { EventEmitter } from '../common/EventEmitter.js';
+import { copyRect, intersectRect, createBound, boundInsideBound, boundLargeThanBound, createPreloadBounds, } from './lib/utils.js';
+import { Matrix3d } from './lib/Matrix3d.js';
+import { RenderCoords } from './lib/RenderCoords.js';
+import { AutosizeMode, Autosizer } from './Autosizer.js';
+import { bucketSortByZIndex, removeChild } from './lib/collectionUtils.js';
+export var CoreNodeRenderState;
+(function (CoreNodeRenderState) {
+    CoreNodeRenderState[CoreNodeRenderState["Init"] = 0] = "Init";
+    CoreNodeRenderState[CoreNodeRenderState["OutOfBounds"] = 2] = "OutOfBounds";
+    CoreNodeRenderState[CoreNodeRenderState["InBounds"] = 4] = "InBounds";
+    CoreNodeRenderState[CoreNodeRenderState["InViewport"] = 8] = "InViewport";
+})(CoreNodeRenderState || (CoreNodeRenderState = {}));
+const NO_CLIPPING_RECT = Object.freeze({
+    x: 0,
+    y: 0,
+    w: 0,
+    h: 0,
+    valid: false,
+    clipRadius: 0,
+});
+const CoreNodeRenderStateMap = new Map();
+CoreNodeRenderStateMap.set(CoreNodeRenderState.Init, 'init');
+CoreNodeRenderStateMap.set(CoreNodeRenderState.OutOfBounds, 'outOfBounds');
+CoreNodeRenderStateMap.set(CoreNodeRenderState.InBounds, 'inBounds');
+CoreNodeRenderStateMap.set(CoreNodeRenderState.InViewport, 'inViewport');
+export var UpdateType;
+(function (UpdateType) {
+    /**
+     * Child updates
+     */
+    UpdateType[UpdateType["Children"] = 1] = "Children";
+    /**
+     * localTransform
+     *
+     * @remarks
+     * CoreNode Properties Updated:
+     * - `localTransform`
+     */
+    UpdateType[UpdateType["Local"] = 2] = "Local";
+    /**
+     * globalTransform
+     *
+     * * @remarks
+     * CoreNode Properties Updated:
+     * - `globalTransform`
+     * - `renderBounds`
+     * - `renderCoords`
+     */
+    UpdateType[UpdateType["Global"] = 4] = "Global";
+    /**
+     * Clipping rect update
+     *
+     * @remarks
+     * CoreNode Properties Updated:
+     * - `clippingRect`
+     */
+    UpdateType[UpdateType["Clipping"] = 8] = "Clipping";
+    /**
+     * Sort Z-Index Children update
+     *
+     * @remarks
+     * CoreNode Properties Updated:
+     * - `children` (sorts children by their `calcZIndex`)
+     */
+    UpdateType[UpdateType["SortZIndexChildren"] = 16] = "SortZIndexChildren";
+    /**
+     * Premultiplied Colors update
+     *
+     * @remarks
+     * CoreNode Properties Updated:
+     * - `premultipliedColorTl`
+     * - `premultipliedColorTr`
+     * - `premultipliedColorBl`
+     * - `premultipliedColorBr`
+     */
+    UpdateType[UpdateType["PremultipliedColors"] = 32] = "PremultipliedColors";
+    /**
+     * World Alpha update
+     *
+     * @remarks
+     * CoreNode Properties Updated:
+     * - `worldAlpha` = `parent.worldAlpha` * `alpha`
+     */
+    UpdateType[UpdateType["WorldAlpha"] = 64] = "WorldAlpha";
+    /**
+     * Render State update
+     *
+     * @remarks
+     * CoreNode Properties Updated:
+     * - `renderState`
+     */
+    UpdateType[UpdateType["RenderState"] = 128] = "RenderState";
+    /**
+     * Is Renderable update
+     *
+     * @remarks
+     * CoreNode Properties Updated:
+     * - `isRenderable`
+     */
+    UpdateType[UpdateType["IsRenderable"] = 256] = "IsRenderable";
+    /**
+     * Render Texture update
+     */
+    UpdateType[UpdateType["RenderTexture"] = 512] = "RenderTexture";
+    /**
+     * Track if parent has render texture
+     */
+    UpdateType[UpdateType["ParentRenderTexture"] = 1024] = "ParentRenderTexture";
+    /**
+     * Render Bounds update
+     */
+    UpdateType[UpdateType["RenderBounds"] = 2048] = "RenderBounds";
+    /**
+     * RecalcUniforms
+     */
+    UpdateType[UpdateType["RecalcUniforms"] = 4096] = "RecalcUniforms";
+    /**
+     * Autosize update
+     */
+    UpdateType[UpdateType["Autosize"] = 8192] = "Autosize";
+    /**
+     * None
+     */
+    UpdateType[UpdateType["None"] = 0] = "None";
+    /**
+     * All
+     */
+    UpdateType[UpdateType["All"] = 16383] = "All";
+})(UpdateType || (UpdateType = {}));
+/**
+ * Bitmask of UpdateType flags that represent a visually significant change
+ * within a node. Used to gate notifyParentRTTOfUpdate() so that RTT surfaces
+ * are only marked dirty when something actually visible changed, rather than
+ * on every update() cycle that merely propagates child traversal.
+ *
+ * Excluded flags (non-visual cascade/bookkeeping):
+ *   Children, RenderBounds, RenderState, ParentRenderTexture, Autosize
+ */
+const RTT_NOTIFY_MASK = UpdateType.Local |
+    UpdateType.Global |
+    UpdateType.Clipping |
+    UpdateType.SortZIndexChildren |
+    UpdateType.PremultipliedColors |
+    UpdateType.WorldAlpha |
+    UpdateType.IsRenderable |
+    UpdateType.RenderTexture |
+    UpdateType.RecalcUniforms;
+/**
+ * A visual Node in the Renderer scene graph.
+ *
+ * @remarks
+ * CoreNode is an internally used class that represents a Renderer Node in the
+ * scene graph. See INode.ts for the public APIs exposed to Renderer users
+ * that include generic types for Shaders.
+ */
+export class CoreNode extends EventEmitter {
+    stage;
+    children = [];
+    _id = getNewId();
+    props;
+    isCoreNode = true;
+    // WebGL Render Op State
+    renderOpBufferIdx = 0;
+    numQuads = 0;
+    renderOpTextures = [];
+    stencilDepth = 0;
+    // Permanent slot of this node's quad in the renderer's quad buffer.
+    // -1 until assigned; reassigned contiguously whenever the render list is
+    // rebuilt (see WebGlRenderer.invalidateQuadBuffer).
+    quadBufferIndex = -1;
+    // Whether the node's quad bytes differ from what the GPU buffer holds.
+    // Set when visual data (transforms, colors, alpha, texture) changes and
+    // cleared once the slot is re-uploaded.
+    isQuadDirty = false;
+    hasShaderUpdater = false;
+    hasShaderTimeFn = false;
+    hasColorProps = false;
+    zIndexMin = 0;
+    zIndexMax = 0;
+    previousZIndex = -1;
+    updateType = UpdateType.All;
+    childUpdateType = UpdateType.None;
+    globalTransform;
+    localTransform;
+    sceneGlobalTransform;
+    renderCoords;
+    sceneRenderCoords;
+    renderBound;
+    strictBound;
+    preloadBound;
+    clippingRect = NO_CLIPPING_RECT;
+    textureCoords;
+    updateShaderUniforms = false;
+    isRenderable = false;
+    renderState = CoreNodeRenderState.Init;
+    /**
+     * True when the node has no rotation, no scale, no mount offset, and no
+     * contain-resize. The vast majority of nodes in a typical TV UI are
+     * "simple" — their local transform is a pure translation.
+     */
+    isSimple = true;
+    /**
+     * True when localTransform is known to be in identity-shape (ta=1, tb=0,
+     * tc=0, td=1) so that subsequent updateLocalTransform calls can skip the
+     * 4 redundant field writes and use setTranslate() instead.
+     */
+    _localIsTranslate = false;
+    /**
+     * True when globalTransform is a pure translation. Read by child nodes in
+     * update() to determine if the translate-only global fast path applies.
+     */
+    _globalIsTranslate = false;
+    /**
+     * Cached result of the contain-resize check, updated in updateIsSimple().
+     */
+    _hasContainResize = false;
+    worldAlpha = 1;
+    premultipliedColorTl = 0;
+    premultipliedColorTr = 0;
+    premultipliedColorBl = 0;
+    premultipliedColorBr = 0;
+    calcZIndex = 0;
+    hasRTTupdates = false;
+    parentHasRenderTexture = false;
+    rttParent = null;
+    /**
+     * only used when rtt = true
+     */
+    framebufferDimensions = null;
+    /**Autosize properties */
+    autosizer = null;
+    parentAutosizer = null;
+    destroyed = false;
+    constructor(stage, props) {
+        super();
+        this.stage = stage;
+        // Initialize the renderOpTextures array with a capacity of 16 (typical max textures)
+        this.renderOpTextures = [];
+        //inital update type
+        let initialUpdateType = UpdateType.Local | UpdateType.RenderBounds | UpdateType.RenderState;
+        const p = (this.props = {});
+        // Fast-path assign only known keys
+        p.x = props.x;
+        p.y = props.y;
+        p.w = props.w;
+        p.h = props.h;
+        p.alpha = props.alpha;
+        p.autosize = props.autosize;
+        p.clipping = props.clipping;
+        p.clipRadius = props.clipRadius;
+        p.color = props.color;
+        p.colorTop = props.colorTop;
+        p.colorBottom = props.colorBottom;
+        p.colorLeft = props.colorLeft;
+        p.colorRight = props.colorRight;
+        p.colorTl = props.colorTl;
+        p.colorTr = props.colorTr;
+        p.colorBl = props.colorBl;
+        p.colorBr = props.colorBr;
+        //check if any color props are set for premultiplied color updates
+        if (props.color > 0 ||
+            props.colorTop > 0 ||
+            props.colorBottom > 0 ||
+            props.colorLeft > 0 ||
+            props.colorRight > 0 ||
+            props.colorTl > 0 ||
+            props.colorTr > 0 ||
+            props.colorBl > 0 ||
+            props.colorBr > 0) {
+            this.hasColorProps = true;
+            initialUpdateType |= UpdateType.PremultipliedColors;
+        }
+        p.scaleX = props.scaleX;
+        p.scaleY = props.scaleY;
+        p.rotation = props.rotation;
+        p.pivotX = props.pivotX;
+        p.pivotY = props.pivotY;
+        p.mountX = props.mountX;
+        p.mountY = props.mountY;
+        p.mount = props.mount;
+        p.pivot = props.pivot;
+        p.zIndex = props.zIndex;
+        p.textureOptions = props.textureOptions;
+        p.data = props.data;
+        p.imageType = props.imageType;
+        p.srcX = props.srcX;
+        p.srcY = props.srcY;
+        p.srcWidth = props.srcWidth;
+        p.srcHeight = props.srcHeight;
+        p.parent = props.parent;
+        p.texture = null;
+        p.shader = null;
+        p.src = null;
+        p.rtt = false;
+        p.boundsMargin = null;
+        // Only set non-default values
+        if (props.zIndex !== 0) {
+            this.zIndex = props.zIndex;
+        }
+        if (props.parent !== null) {
+            props.parent.addChild(this);
+        }
+        // Assign saved values through setters only when they differ from
+        // defaults. In the common path most nodes are created with null texture,
+        // default shader, no src, rtt=false, no boundsMargin, and
+        // interactive=false — skipping the setter avoids equality checks,
+        // setUpdateType traversals, and redundant texture/shader operations.
+        if (props.texture !== null) {
+            this.texture = props.texture;
+        }
+        if (props.shader === null || props.shader === this.stage.defShaderNode) {
+            // Default shader — bypass the setter entirely; just point props at
+            // the default shader node without triggering setUpdateType or
+            // attachNode.
+            p.shader = this.stage.defShaderNode;
+        }
+        else {
+            this.shader = props.shader;
+        }
+        if (props.src !== null) {
+            this.src = props.src;
+        }
+        if (props.rtt !== false) {
+            this.rtt = props.rtt;
+        }
+        if (props.boundsMargin !== null) {
+            this.boundsMargin = props.boundsMargin;
+        }
+        if (props.interactive !== false) {
+            this.interactive = props.interactive;
+        }
+        // Initialize autosize if enabled
+        if (p.autosize === true) {
+            this.autosizer = new Autosizer(this);
+        }
+        this.setUpdateType(initialUpdateType);
+        // if the default texture isn't loaded yet, wait for it to load
+        // this only happens when the node is created before the stage is ready
+        const dt = stage.defaultTexture;
+        if (dt !== null && dt.state !== 'loaded') {
+            dt.once('loaded', () => this.setUpdateType(UpdateType.IsRenderable));
+        }
+        this.updateIsSimple();
+    }
+    //#region Textures
+    loadTexture() {
+        const texture = this.props.texture;
+        if (texture === null) {
+            return;
+        }
+        if (this.textureOptions.preload === true) {
+            this.stage.txManager.loadTexture(texture);
+        }
+        texture.preventCleanup = this.props.textureOptions.preventCleanup ?? false;
+        texture.on('loaded', this.onTextureLoaded);
+        texture.on('failed', this.onTextureFailed);
+        texture.on('freed', this.onTextureFreed);
+        if (texture.state === 'loaded' ||
+            texture.state === 'failed' ||
+            texture.state === 'freed') {
+            queueMicrotask(this.loadTextureTask);
+        }
+    }
+    loadTextureTask = () => {
+        const texture = this.props.texture;
+        if (texture === null) {
+            return;
+        }
+        if (texture.state === 'loaded') {
+            this.onTextureLoaded(texture, texture.dimensions);
+        }
+        else if (texture.state === 'failed') {
+            this.onTextureFailed(texture, texture.error);
+        }
+        else if (texture.state === 'freed') {
+            this.onTextureFreed(texture);
+        }
+    };
+    unloadTexture() {
+        if (this.texture === null) {
+            return;
+        }
+        const texture = this.texture;
+        texture.off('loaded', this.onTextureLoaded);
+        texture.off('failed', this.onTextureFailed);
+        texture.off('freed', this.onTextureFreed);
+        texture.setRenderableOwner(this._id, false);
+    }
+    onTextureLoaded = (_target, dimensions) => {
+        if (this.autosizer !== null) {
+            this.autosizer.update();
+        }
+        this.setUpdateType(UpdateType.IsRenderable);
+        // Texture was loaded. In case the RAF loop has already stopped, we request
+        // a render to ensure the texture is rendered.
+        this.stage.requestRender();
+        // If parent has a render texture, flag that we need to update
+        if (this.parentHasRenderTexture) {
+            this.notifyParentRTTOfUpdate();
+        }
+        // ignore 1x1 pixel textures
+        if (dimensions.w > 1 && dimensions.h > 1) {
+            // Defer only the user-facing emit. State changes above stay
+            // synchronous so the same-frame render still picks up the texture.
+            // This preserves the pre-sync-fast-path ordering where the text
+            // 'loaded' event (queued via queueMicrotask in handleRenderResult)
+            // is observed before the texture 'loaded' event.
+            this.pendingTextureLoadedDimensions = dimensions;
+            queueMicrotask(this.emitTextureLoadedTask);
+        }
+        if (this.stage.calculateTextureCoord === true) {
+            this.textureCoords = this.stage.renderer.getTextureCoords(this);
+        }
+        // Trigger a local update if the texture is loaded and the resizeMode is 'contain'
+        if (this.props.textureOptions.resizeMode?.type === 'contain') {
+            this.setUpdateType(UpdateType.Local);
+        }
+    };
+    onTextureFailed = (_target, error) => {
+        // immediately set isRenderable to false, so that we handle the error
+        // without waiting for the next frame loop
+        this.isRenderable = false;
+        this.updateTextureOwnership(false);
+        this.setUpdateType(UpdateType.IsRenderable);
+        // If parent has a render texture, flag that we need to update
+        if (this.parentHasRenderTexture) {
+            this.notifyParentRTTOfUpdate();
+        }
+        if (this.texture !== null &&
+            this.texture.retryCount > this.texture.maxRetryCount) {
+            this.pendingTextureFailedError = error;
+            queueMicrotask(this.emitTextureFailedTask);
+        }
+    };
+    onTextureFreed = () => {
+        // immediately set isRenderable to false, so that we handle the error
+        // without waiting for the next frame loop
+        this.isRenderable = false;
+        this.updateTextureOwnership(false);
+        this.setUpdateType(UpdateType.IsRenderable);
+        // If parent has a render texture, flag that we need to update
+        if (this.parentHasRenderTexture) {
+            this.notifyParentRTTOfUpdate();
+        }
+        queueMicrotask(this.emitTextureFreedTask);
+    };
+    pendingTextureLoadedDimensions = null;
+    emitTextureLoadedTask = () => {
+        this.emit('loaded', {
+            type: 'texture',
+            dimensions: this.pendingTextureLoadedDimensions,
+        });
+    };
+    pendingTextureFailedError = null;
+    emitTextureFailedTask = () => {
+        this.emit('failed', {
+            type: 'texture',
+            error: this.pendingTextureFailedError,
+        });
+    };
+    emitTextureFreedTask = () => {
+        this.emit('freed', {
+            type: 'texture',
+        });
+    };
+    //#endregion Textures
+    /**
+     * Change types types is used to determine the scope of the changes being applied
+     *
+     * @remarks
+     * See {@link UpdateType} for more information on each type
+     *
+     * @param type
+     */
+    setUpdateType(type) {
+        this.updateType |= type;
+        const parent = this.props.parent;
+        if (parent === null || parent === undefined)
+            return;
+        // Short-circuit: if parent already has Children flag set, skip the
+        // recursive call up the parent chain. This prevents redundant traversal
+        // when many siblings mark the same parent dirty in a single frame.
+        if (parent.updateType & UpdateType.Children)
+            return;
+        parent.setUpdateType(UpdateType.Children);
+    }
+    /**
+     * Recompute the isSimple flag and the cached contain-resize check.
+     *
+     * @remarks
+     * Called from property setters that affect whether the node is "simple"
+     * (rotation, scaleX, scaleY, mountX, mountY, texture, textureOptions).
+     * This runs on the cold setter path, not per-frame.
+     */
+    updateIsSimple() {
+        const p = this.props;
+        this._hasContainResize =
+            p.texture !== null &&
+                p.textureOptions.resizeMode?.type === 'contain';
+        this.isSimple =
+            p.rotation === 0 &&
+                p.scaleX === 1 &&
+                p.scaleY === 1 &&
+                p.mountX === 0 &&
+                p.mountY === 0 &&
+                this._hasContainResize === false;
+    }
+    updateLocalTransform() {
+        const p = this.props;
+        const { x, y } = p;
+        if (this.isSimple === true) {
+            // Fast path: no rotation, no scale, no mount, no contain-resize.
+            // The local transform is a pure translation.
+            if (this._localIsTranslate === true) {
+                // Matrix is already identity-shape — only tx/ty need updating.
+                this.localTransform.setTranslate(x, y);
+                return;
+            }
+            // First time on the simple path (or transitioning from non-simple):
+            // write full identity + translation, then mark for future setTranslate.
+            this.localTransform = Matrix3d.translate(x, y, this.localTransform);
+            this._localIsTranslate = true;
+            return;
+        }
+        // Non-simple path: need w/h for mount/pivot calculations.
+        const { w, h } = p;
+        const mountTranslateX = p.mountX * w;
+        const mountTranslateY = p.mountY * h;
+        const rotation = p.rotation;
+        const scaleX = p.scaleX;
+        const scaleY = p.scaleY;
+        if (rotation !== 0) {
+            // Full rotation (+ optional scale + pivot).
+            // Reuse Matrix3d.temp to avoid allocation.
+            const scaleRotate = Matrix3d.rotate(rotation, Matrix3d.temp).scale(scaleX, scaleY);
+            const pivotTranslateX = p.pivotX * w;
+            const pivotTranslateY = p.pivotY * h;
+            this.localTransform = Matrix3d.translate(x - mountTranslateX + pivotTranslateX, y - mountTranslateY + pivotTranslateY, this.localTransform)
+                .multiply(scaleRotate)
+                .translate(-pivotTranslateX, -pivotTranslateY);
+        }
+        else if (scaleX !== 1 || scaleY !== 1) {
+            // Scale (+ optional pivot) without rotation — skip the rotate matrix
+            // and the 8-mul multiply; .scale() is a 4-mul in-place op.
+            const pivotTranslateX = p.pivotX * w;
+            const pivotTranslateY = p.pivotY * h;
+            this.localTransform = Matrix3d.translate(x - mountTranslateX + pivotTranslateX, y - mountTranslateY + pivotTranslateY, this.localTransform)
+                .scale(scaleX, scaleY)
+                .translate(-pivotTranslateX, -pivotTranslateY);
+        }
+        else {
+            // Mount only — pure translation.
+            this.localTransform = Matrix3d.translate(x - mountTranslateX, y - mountTranslateY, this.localTransform);
+        }
+        // Handle 'contain' resize mode (cached check)
+        const texture = p.texture;
+        if (this._hasContainResize === true &&
+            texture !== null &&
+            texture.dimensions !== null) {
+            let resizeModeScaleX = 1;
+            let resizeModeScaleY = 1;
+            let extraX = 0;
+            let extraY = 0;
+            const { w: tw, h: th } = texture.dimensions;
+            const txAspectRatio = tw / th;
+            const nodeAspectRatio = w / h;
+            if (txAspectRatio > nodeAspectRatio) {
+                const scaleX = w / tw;
+                const scaledTxHeight = th * scaleX;
+                extraY = (h - scaledTxHeight) / 2;
+                resizeModeScaleY = scaledTxHeight / h;
+            }
+            else {
+                const scaleY = h / th;
+                const scaledTxWidth = tw * scaleY;
+                extraX = (w - scaledTxWidth) / 2;
+                resizeModeScaleX = scaledTxWidth / w;
+            }
+            this.localTransform
+                .translate(extraX, extraY)
+                .scale(resizeModeScaleX, resizeModeScaleY);
+        }
+        this._localIsTranslate = false;
+    }
+    /**
+     * @todo: test for correct calculation flag
+     * @param delta
+     */
+    update(delta, parentClippingRect) {
+        const props = this.props;
+        const parent = props.parent;
+        const parentHasRenderTexture = this.parentHasRenderTexture;
+        const hasParent = props.parent !== null;
+        let newRenderState = null;
+        let updateType = this.updateType;
+        let childUpdateType = this.childUpdateType;
+        let updateParent = false;
+        //this needs to be handled before setting updateTypes are reset
+        if (updateType & UpdateType.Autosize && this.autosizer !== null) {
+            this.autosizer.update();
+        }
+        // reset update type
+        this.updateType = 0;
+        this.childUpdateType = 0;
+        if (updateType & UpdateType.Local) {
+            this.updateLocalTransform();
+            updateType |= UpdateType.Global;
+            updateParent = hasParent;
+        }
+        // Handle specific RTT updates at this node level
+        if (updateType & UpdateType.RenderTexture && this.rtt === true) {
+            this.hasRTTupdates = true;
+        }
+        if (updateType & UpdateType.Global) {
+            const lt = this.localTransform;
+            const gt = this.globalTransform ?? (this.globalTransform = new Matrix3d());
+            let fastPathApplied = false;
+            if (this.parentHasRenderTexture === true && parent?.rtt === true) {
+                // RTT root: reset globalTransform for correct RTT rendering
+                Matrix3d.identity(gt);
+                // Maintain a full scene global transform for bounds detection
+                this.sceneGlobalTransform = Matrix3d.copy(parent.globalTransform || Matrix3d.identity(Matrix3d.temp), this.sceneGlobalTransform).translateOrMultiply(lt);
+                this._globalIsTranslate = this.isSimple;
+            }
+            else if (this.parentHasRenderTexture === true &&
+                parent?.rtt === false) {
+                // RTT chain: propagate sceneGlobalTransform from parent
+                this.sceneGlobalTransform = Matrix3d.copy(parent.sceneGlobalTransform || lt, this.sceneGlobalTransform).translateOrMultiply(lt);
+                Matrix3d.copy(parent.globalTransform || lt, gt);
+                this._globalIsTranslate = false;
+            }
+            else {
+                // Common non-RTT path
+                const parentGT = parent?.globalTransform;
+                if (this.isSimple === true &&
+                    parent !== null &&
+                    parent._globalIsTranslate === true &&
+                    parentGT !== undefined) {
+                    // Translate-only fast path: both parent global and local are pure
+                    // translations. The global transform collapses to 2 additions.
+                    if (this._globalIsTranslate === false) {
+                        gt.ta = 1;
+                        gt.tb = 0;
+                        gt.tc = 0;
+                        gt.td = 1;
+                    }
+                    gt.setTranslate(parentGT.tx + lt.tx, parentGT.ty + lt.ty);
+                    this._globalIsTranslate = true;
+                    fastPathApplied = true;
+                }
+                else {
+                    Matrix3d.copy(parentGT || lt, gt);
+                    this._globalIsTranslate =
+                        this.isSimple === true &&
+                            parent !== null &&
+                            parent._globalIsTranslate === true;
+                }
+            }
+            if (fastPathApplied === false) {
+                if (parent !== null) {
+                    if (this.isSimple === true) {
+                        gt.translate(lt.tx, lt.ty);
+                    }
+                    else {
+                        gt.translateOrMultiply(lt);
+                    }
+                }
+            }
+            this.calculateRenderCoords();
+            this.updateBoundingRect();
+            updateType |= UpdateType.RenderState;
+            updateParent = hasParent;
+            //only propagate children updates if not autosizing
+            if ((updateType & UpdateType.Autosize) === 0) {
+                updateType |= UpdateType.Children;
+                childUpdateType |= UpdateType.Global;
+            }
+            if (this.clipping === true) {
+                updateType |= UpdateType.Clipping | UpdateType.RenderBounds;
+                updateParent = hasParent;
+                childUpdateType |= UpdateType.RenderBounds;
+            }
+        }
+        if (updateType & UpdateType.RenderBounds) {
+            this.createRenderBounds();
+            updateType |= UpdateType.RenderState | UpdateType.Children;
+            updateParent = hasParent;
+            childUpdateType |= UpdateType.RenderBounds;
+        }
+        if (updateType & UpdateType.RenderState) {
+            newRenderState = this.checkRenderBounds();
+            updateType |= UpdateType.IsRenderable;
+            updateParent = hasParent;
+            // if we're not going out of bounds, update the render state
+            // this is done so the update loop can finish before we mark a node
+            // as out of bounds
+            if (newRenderState !== CoreNodeRenderState.OutOfBounds) {
+                this.updateRenderState(newRenderState);
+            }
+        }
+        if (updateType & UpdateType.WorldAlpha) {
+            const previousWorldAlpha = this.worldAlpha;
+            this.worldAlpha = (parent?.worldAlpha ?? 1) * this.props.alpha;
+            if ((previousWorldAlpha === 0) !== (this.worldAlpha === 0)) {
+                // The flat render list excludes nodes with worldAlpha === 0, so any
+                // zero-crossing transition (excluded <-> included) must invalidate it.
+                this.stage.requestRenderListUpdate();
+            }
+            updateType |=
+                UpdateType.PremultipliedColors |
+                    UpdateType.Children |
+                    UpdateType.IsRenderable;
+            updateParent = hasParent;
+            childUpdateType |= UpdateType.WorldAlpha;
+        }
+        if (updateType & UpdateType.IsRenderable) {
+            this.updateIsRenderable();
+        }
+        // Handle autosize updates when children transforms change
+        if (updateType & UpdateType.Global &&
+            this.isRenderable === true &&
+            this.parentAutosizer !== null) {
+            this.parentAutosizer.patch(this.id);
+        }
+        if (updateType & UpdateType.Clipping) {
+            this.calculateClippingRect(parentClippingRect);
+            updateType |= UpdateType.Children;
+            updateParent = hasParent;
+            childUpdateType |= UpdateType.Clipping | UpdateType.RenderBounds;
+        }
+        if (updateType & UpdateType.PremultipliedColors) {
+            const alpha = this.worldAlpha;
+            const tl = props.colorTl;
+            const tr = props.colorTr;
+            const bl = props.colorBl;
+            const br = props.colorBr;
+            // Fast equality check (covers all 4 corners)
+            const same = tl === tr && tl === bl && tl === br;
+            const merged = mergeColorAlphaPremultiplied(tl, alpha, true);
+            this.premultipliedColorTl = merged;
+            if (same === true) {
+                this.premultipliedColorTr =
+                    this.premultipliedColorBl =
+                        this.premultipliedColorBr =
+                            merged;
+            }
+            else {
+                this.premultipliedColorTr = mergeColorAlphaPremultiplied(tr, alpha, true);
+                this.premultipliedColorBl = mergeColorAlphaPremultiplied(bl, alpha, true);
+                this.premultipliedColorBr = mergeColorAlphaPremultiplied(br, alpha, true);
+            }
+        }
+        // Mark the quad dirty only when visual data (transforms, colors, alpha)
+        // actually changed so the renderer re-uploads only modified slots.
+        // Skipped unless surgical dirty-quad repaints are enabled (PR #861).
+        if (this.stage.options.enableDirtyRepaints === true &&
+            updateType &
+                (UpdateType.Global |
+                    UpdateType.PremultipliedColors |
+                    UpdateType.WorldAlpha)) {
+            this.isQuadDirty = true;
+        }
+        if (this.renderState === CoreNodeRenderState.OutOfBounds) {
+            // Delay updating children until the node is in bounds
+            this.updateType = updateType;
+            this.childUpdateType = childUpdateType;
+            return;
+        }
+        if (updateParent === true) {
+            parent.setUpdateType(UpdateType.Children);
+        }
+        if (updateType & UpdateType.RecalcUniforms &&
+            this.hasShaderUpdater === true) {
+            this.updateShaderUniforms = true;
+        }
+        if (this.isRenderable === true && this.updateShaderUniforms === true) {
+            this.updateShaderUniforms = false;
+            //this exists because the boolean hasShaderUpdater === true
+            this.shader.update();
+        }
+        if (updateType & UpdateType.Children && this.children.length > 0) {
+            let childClippingRect = this.clippingRect;
+            if (this.rtt === true) {
+                childClippingRect = NO_CLIPPING_RECT;
+            }
+            for (let i = 0, length = this.children.length; i < length; i++) {
+                const child = this.children[i];
+                if (childUpdateType !== 0) {
+                    child.setUpdateType(childUpdateType);
+                }
+                if (child.updateType === 0) {
+                    continue;
+                }
+                child.update(delta, childClippingRect);
+            }
+        }
+        // If the node has an RTT parent and a visually relevant change occurred (or a
+        // nested RTT child already flagged this node via hasRTTupdates), notify the
+        // nearest RTT ancestor so it re-renders its surface.
+        // Guarded by RTT_NOTIFY_MASK to avoid redundant notifications on frames where
+        // only child-traversal bookkeeping flags (Children, RenderBounds, etc.) are set.
+        if (parentHasRenderTexture === true &&
+            (this.hasRTTupdates === true || (updateType & RTT_NOTIFY_MASK) !== 0)) {
+            this.notifyParentRTTOfUpdate();
+        }
+        //Resort children if needed
+        if (updateType & UpdateType.SortZIndexChildren) {
+            // reorder z-index
+            this.sortChildren();
+        }
+        // If we're out of bounds, apply the render state now
+        // this is done so nodes can finish their entire update loop before
+        // being marked as out of bounds
+        if (newRenderState === CoreNodeRenderState.OutOfBounds) {
+            this.updateRenderState(newRenderState);
+            this.updateIsRenderable();
+            if (this.rtt === true &&
+                newRenderState === CoreNodeRenderState.OutOfBounds) {
+                // notify children that we are going out of bounds
+                // we have to do this now before we stop processing the render tree
+                this.notifyChildrenRTTOfUpdate(newRenderState);
+            }
+        }
+    }
+    findParentRTTNode() {
+        let rttNode = this.parent;
+        while (rttNode && !rttNode.rtt) {
+            rttNode = rttNode.parent;
+        }
+        return rttNode;
+    }
+    notifyChildrenRTTOfUpdate(renderState) {
+        for (const child of this.children) {
+            // force child to update render state
+            child.updateRenderState(renderState);
+            child.updateIsRenderable();
+            child.notifyChildrenRTTOfUpdate(renderState);
+        }
+    }
+    notifyParentRTTOfUpdate() {
+        if (this.parent === null) {
+            return;
+        }
+        const rttNode = this.rttParent || this.findParentRTTNode();
+        if (!rttNode) {
+            return;
+        }
+        // If an RTT node is found, mark it for re-rendering
+        rttNode.hasRTTupdates = true;
+        rttNode.setUpdateType(UpdateType.RenderTexture);
+        // if rttNode is nested, also make it update its RTT parent
+        if (rttNode.parentHasRenderTexture === true) {
+            rttNode.notifyParentRTTOfUpdate();
+        }
+    }
+    checkRenderBounds() {
+        if (boundInsideBound(this.renderBound, this.strictBound)) {
+            return CoreNodeRenderState.InViewport;
+        }
+        if (boundInsideBound(this.renderBound, this.preloadBound)) {
+            return CoreNodeRenderState.InBounds;
+        }
+        // check if we're larger then our parent, we're definitely in the viewport
+        if (boundLargeThanBound(this.renderBound, this.strictBound)) {
+            return CoreNodeRenderState.InViewport;
+        }
+        // check if we dont have dimensions, take our parent's render state
+        if (this.parent !== null && (this.props.w === 0 || this.props.h === 0)) {
+            return this.parent.renderState;
+        }
+        return CoreNodeRenderState.OutOfBounds;
+    }
+    updateBoundingRect() {
+        const transform = (this.sceneGlobalTransform ||
+            this.globalTransform);
+        const renderCoords = (this.sceneRenderCoords ||
+            this.renderCoords);
+        if (transform.tb === 0 || transform.tc === 0) {
+            this.renderBound = createBound(renderCoords.x1, renderCoords.y1, renderCoords.x3, renderCoords.y3, this.renderBound);
+        }
+        else {
+            const { x1, y1, x2, y2, x3, y3, x4, y4 } = renderCoords;
+            this.renderBound = createBound(Math.min(x1, x2, x3, x4), Math.min(y1, y2, y3, y4), Math.max(x1, x2, x3, x4), Math.max(y1, y2, y3, y4), this.renderBound);
+        }
+    }
+    createRenderBounds() {
+        if (this.parent !== null && this.parent.strictBound !== undefined) {
+            // we have a parent with a valid bound, copy it
+            const parentBound = this.parent.strictBound;
+            this.strictBound = createBound(parentBound.x1, parentBound.y1, parentBound.x2, parentBound.y2);
+            this.preloadBound = createPreloadBounds(this.strictBound, this.boundsMargin);
+        }
+        else {
+            // no parent or parent does not have a bound, take the stage boundaries
+            this.strictBound = this.stage.strictBound;
+            this.preloadBound = this.stage.preloadBound;
+        }
+        // if clipping is disabled, we're done
+        if (this.props.clipping === false) {
+            return;
+        }
+        // only create local clipping bounds if node itself is in bounds
+        // this can only be done if we have a render bound already
+        if (this.renderBound === undefined) {
+            return;
+        }
+        // Only skip creating local clip bounds when the node is completely outside
+        // the preload zone (not just outside the strict viewport).  Using strictBound
+        // here caused a preload regression: a clipping parent that had entered the
+        // preload zone (InBounds) would not narrow strictBound for its children,
+        // so children used the full-stage preloadBound and never got preloaded
+        // until the parent reached the viewport itself.
+        if (boundInsideBound(this.renderBound, this.preloadBound) === false) {
+            return;
+        }
+        // clipping is enabled and we are in bounds create our own bounds
+        const { x, y, w, h } = this.props;
+        // Pick the global transform if available, otherwise use the local transform
+        // global transform is only available if the node in an RTT chain
+        const { tx, ty } = this.sceneGlobalTransform || this.globalTransform || {};
+        const _x = tx ?? x;
+        const _y = ty ?? y;
+        this.strictBound = createBound(_x, _y, _x + w, _y + h, this.strictBound);
+        this.preloadBound = createPreloadBounds(this.strictBound, this.boundsMargin);
+    }
+    updateRenderState(renderState) {
+        if (renderState === this.renderState) {
+            return;
+        }
+        const previous = this.renderState;
+        this.renderState = renderState;
+        // Render state transitions (in/out of bounds, visibility) change which
+        // nodes appear in the flat render list, so mark it stale.
+        this.stage.requestRenderListUpdate();
+        const event = CoreNodeRenderStateMap.get(renderState);
+        assertTruthy(event);
+        this.emit(event, {
+            previous,
+            current: renderState,
+        });
+    }
+    /**
+     * Checks if the node is renderable based on world alpha, dimensions and out of bounds status.
+     */
+    checkBasicRenderability() {
+        if (this.worldAlpha === 0 || this.isOutOfBounds() === true) {
+            return false;
+        }
+        else {
+            return true;
+        }
+    }
+    /**
+     * Updates the `isRenderable` property based on various conditions.
+     */
+    updateIsRenderable() {
+        let newIsRenderable = false;
+        let needsTextureOwnership = false;
+        // If the node is out of bounds or has an alpha of 0, it is not renderable
+        if (this.checkBasicRenderability() === false) {
+            this.updateTextureOwnership(false);
+            this.setRenderable(false);
+            return;
+        }
+        if (this.texture !== null) {
+            // preemptive check for failed textures this will mark the current node as non-renderable
+            // and will prevent further checks until the texture is reloaded or retry is reset on the texture
+            if (this.texture.retryCount > this.texture.maxRetryCount) {
+                // texture has failed to load, we cannot render
+                this.updateTextureOwnership(false);
+                this.setRenderable(false);
+                return;
+            }
+            needsTextureOwnership = true;
+            // we're only renderable if the texture state is loaded
+            newIsRenderable = this.texture.state === 'loaded';
+        }
+        else if (
+        // check shader
+        (this.props.shader !== null || this.hasColorProps === true) &&
+            // check dimensions
+            this.hasDimensions() === true) {
+            // This mean we have dimensions and a color set, so we can render a ColorTexture
+            if (this.stage.defaultTexture &&
+                this.stage.defaultTexture.state === 'loaded') {
+                newIsRenderable = true;
+            }
+        }
+        this.updateTextureOwnership(needsTextureOwnership);
+        this.setRenderable(newIsRenderable);
+    }
+    /**
+     * Sets the renderable state and triggers changes if necessary.
+     * @param isRenderable - The new renderable state
+     */
+    setRenderable(isRenderable) {
+        const previousIsRenderable = this.isRenderable;
+        this.isRenderable = isRenderable;
+        // Emit event if renderable status has changed
+        if (previousIsRenderable !== isRenderable) {
+            // Renderable changes alter which nodes are present in the flat render
+            // list, so mark it stale.
+            this.stage.requestRenderListUpdate();
+            this.emit('renderable', {
+                type: 'renderable',
+                isRenderable,
+            });
+        }
+    }
+    /**
+     * Changes the renderable state of the node.
+     */
+    updateTextureOwnership(isRenderable) {
+        this.texture?.setRenderableOwner(this._id, isRenderable);
+    }
+    /**
+     * Checks if the node is out of the viewport bounds.
+     */
+    isOutOfBounds() {
+        return this.renderState <= CoreNodeRenderState.OutOfBounds;
+    }
+    /**
+     * Checks if the node has dimensions (width/height)
+     */
+    hasDimensions() {
+        return this.props.w !== 0 && this.props.h !== 0;
+    }
+    calculateRenderCoords() {
+        const { w, h } = this.props;
+        const g = this.globalTransform;
+        const tx = g.tx, ty = g.ty, ta = g.ta, tb = g.tb, tc = g.tc, td = g.td;
+        if (tb === 0 && tc === 0) {
+            const minX = tx;
+            const maxX = tx + w * ta;
+            const minY = ty;
+            const maxY = ty + h * td;
+            this.renderCoords = RenderCoords.translate(
+            //top-left
+            minX, minY, 
+            //top-right
+            maxX, minY, 
+            //bottom-right
+            maxX, maxY, 
+            //bottom-left
+            minX, maxY, this.renderCoords);
+        }
+        else {
+            this.renderCoords = RenderCoords.translate(
+            //top-left
+            tx, ty, 
+            //top-right
+            tx + w * ta, ty + w * tc, 
+            //bottom-right
+            tx + w * ta + h * tb, ty + w * tc + h * td, 
+            //bottom-left
+            tx + h * tb, ty + h * td, this.renderCoords);
+        }
+        if (this.sceneGlobalTransform === undefined) {
+            return;
+        }
+        const { tx: stx, ty: sty, ta: sta, tb: stb, tc: stc, td: std, } = this.sceneGlobalTransform;
+        if (stb === 0 && stc === 0) {
+            const minX = stx;
+            const maxX = stx + w * sta;
+            const minY = sty;
+            const maxY = sty + h * std;
+            this.sceneRenderCoords = RenderCoords.translate(
+            //top-left
+            minX, minY, 
+            //top-right
+            maxX, minY, 
+            //bottom-right
+            maxX, maxY, 
+            //bottom-left
+            minX, maxY, this.sceneRenderCoords);
+        }
+        else {
+            this.sceneRenderCoords = RenderCoords.translate(
+            //top-left
+            stx, sty, 
+            //top-right
+            stx + w * sta, sty + w * stc, 
+            //bottom-right
+            stx + w * sta + h * stb, sty + w * stc + h * std, 
+            //bottom-left
+            stx + h * stb, sty + h * std, this.sceneRenderCoords);
+        }
+    }
+    /**
+     * This function calculates the clipping rectangle for a node.
+     *
+     * The function then checks if the node is rotated. If the node requires clipping and is not rotated, a new clipping rectangle is created based on the node's global transform and dimensions.
+     * If a parent clipping rectangle exists, it is intersected with the node's clipping rectangle (if it exists), or replaces the node's clipping rectangle.
+     *
+     * Finally, the node's parentClippingRect and clippingRect properties are updated.
+     */
+    calculateClippingRect(parentClippingRect) {
+        const { props, globalTransform: gt } = this;
+        const { clipping } = props;
+        const isRotated = gt.tb !== 0 || gt.tc !== 0;
+        const needsMutableRect = (clipping === true && isRotated === false) ||
+            parentClippingRect.valid === true;
+        // Lazily allocate a mutable clipping rect only when this node actually
+        // needs one. Most nodes never clip and can share the frozen default.
+        let clippingRect = this.clippingRect;
+        if (needsMutableRect === true) {
+            if (clippingRect === NO_CLIPPING_RECT) {
+                clippingRect = { x: 0, y: 0, w: 0, h: 0, valid: false, clipRadius: 0 };
+                this.clippingRect = clippingRect;
+            }
+        }
+        else {
+            // No clipping needed — reset to shared frozen default
+            this.clippingRect = NO_CLIPPING_RECT;
+            return;
+        }
+        if (clipping === true && isRotated === false) {
+            clippingRect.x = gt.tx;
+            clippingRect.y = gt.ty;
+            clippingRect.w = this.props.w * gt.ta;
+            clippingRect.h = this.props.h * gt.td;
+            clippingRect.clipRadius = props.clipRadius;
+            clippingRect.valid = true;
+        }
+        else {
+            clippingRect.valid = false;
+            clippingRect.clipRadius = 0;
+        }
+        if (parentClippingRect.valid === true && clippingRect.valid === true) {
+            const ownRadius = clippingRect.clipRadius;
+            intersectRect(parentClippingRect, clippingRect, clippingRect);
+            clippingRect.clipRadius = ownRadius;
+            if (clippingRect.w <= 0 || clippingRect.h <= 0) {
+                // Empty intersection: the node is fully outside its clip region.
+                // Keep the rect valid with zero area (matching CanvasRenderer, which
+                // skips zero-area clips) so the subtree stays scissored to nothing.
+                // Flipping to invalid here would make descendants inherit the shared
+                // no-clip rect and draw fully unclipped outside the clip region.
+                clippingRect.clipRadius = 0;
+            }
+        }
+        else if (parentClippingRect.valid === true) {
+            copyRect(parentClippingRect, clippingRect);
+            clippingRect.clipRadius = parentClippingRect.clipRadius;
+            clippingRect.valid = true;
+        }
+    }
+    /**
+     * Destroy the node and cleanup all resources
+     */
+    destroy() {
+        if (this.destroyed === true) {
+            return;
+        }
+        this.removeAllListeners();
+        this.destroyed = true;
+        // Remove from the Stage's interactive Set so a destroyed node isn't
+        // retained forever (memory leak: destroyed CoreNodes stayed pinned here).
+        this.stage.interactiveNodes.delete(this);
+        this.unloadTexture();
+        this.isRenderable = false;
+        if (this.hasShaderTimeFn === true) {
+            this.stage.untrackTimedNode(this);
+        }
+        const { children, parent } = this;
+        // Kill children
+        for (let i = children.length - 1; i > -1; i--) {
+            children[i].destroy();
+        }
+        if (parent !== null) {
+            parent.removeChild(this);
+        }
+        this.props.parent = null;
+        this.props.texture = null;
+        if (this.rtt === true) {
+            this.stage.renderer.removeRTTNode(this);
+        }
+        this.stage.requestRender();
+    }
+    renderQuads(renderer) {
+        if (this.parentHasRenderTexture === true) {
+            const rtt = renderer.renderToTextureActive;
+            if (rtt === false || this.parentRenderTexture !== renderer.activeRttNode)
+                return;
+        }
+        const texture = this.props.texture || this.stage.defaultTexture;
+        // There is a race condition where the texture can be null
+        // with RTT nodes. Adding this defensively to avoid errors.
+        // Also check if we have a valid texture or default texture to render
+        if (!texture || texture.state !== 'loaded') {
+            return;
+        }
+        renderer.addQuad(this);
+    }
+    get quadBufferCollection() {
+        return this.stage.renderer.quadBufferCollection;
+    }
+    get time() {
+        if (this.hasShaderTimeFn === true) {
+            return this.getTimerValue();
+        }
+        return 0;
+    }
+    getTimerValue() {
+        if (typeof this.shader.time === 'function') {
+            return this.shader.time(this.stage);
+        }
+        return this.stage.elapsedTime;
+    }
+    sortChildren() {
+        const children = this.children;
+        const n = children.length;
+        if (n === 0) {
+            this.zIndexMin = 0;
+            this.zIndexMax = 0;
+            return;
+        }
+        let firstZIndex = children[0].props.zIndex;
+        let min = firstZIndex;
+        let max = firstZIndex;
+        let prevZIndex = firstZIndex;
+        let isSorted = true;
+        for (let i = 1; i < n; i++) {
+            const zIndex = children[i].props.zIndex;
+            if (zIndex < min) {
+                min = zIndex;
+            }
+            else if (zIndex > max) {
+                max = zIndex;
+            }
+            if (prevZIndex > zIndex) {
+                isSorted = false;
+            }
+            prevZIndex = zIndex;
+        }
+        // update min and max zIndex
+        this.zIndexMin = min;
+        this.zIndexMax = max;
+        // if min and max are the same, no need to sort
+        if (min === max || isSorted === true) {
+            return;
+        }
+        bucketSortByZIndex(children, min);
+        // The flat render list caches child order, so any actual re-order
+        // invalidates it.
+        this.stage.requestRenderListUpdate();
+    }
+    removeChild(node, targetParent = null) {
+        if (targetParent === null) {
+            if (this.props.rtt === true && this.parentHasRenderTexture === true) {
+                node.clearRTTInheritance();
+            }
+            const autosizeTarget = this.autosizer || this.parentAutosizer;
+            if (autosizeTarget !== null) {
+                autosizeTarget.detach(node);
+            }
+        }
+        const children = this.children;
+        removeChild(node, children);
+        // The flat render list caches which nodes are present, so any structural
+        // change invalidates it.
+        this.stage.requestRenderListUpdate();
+        if (children.length === 0) {
+            this.zIndexMin = 0;
+            this.zIndexMax = 0;
+            return;
+        }
+        const removedZIndex = node.zIndex;
+        if (removedZIndex === this.zIndexMin || removedZIndex === this.zIndexMax) {
+            this.setUpdateType(UpdateType.SortZIndexChildren);
+        }
+    }
+    addChild(node, previousParent = null) {
+        const inRttCluster = this.props.rtt === true || this.parentHasRenderTexture === true;
+        const children = this.children;
+        const zIndex = node.zIndex;
+        const autosizeTarget = this.autosizer || this.parentAutosizer;
+        let attachToAutosizer = autosizeTarget !== null;
+        node.parentHasRenderTexture = inRttCluster;
+        if (previousParent !== null) {
+            const previousParentInRttCluster = previousParent.props.rtt === true ||
+                previousParent.parentHasRenderTexture === true;
+            if (inRttCluster === false && previousParentInRttCluster === true) {
+                // update child RTT status
+                node.clearRTTInheritance();
+            }
+            const previousAutosizer = node.autosizer || node.parentAutosizer;
+            if (previousAutosizer !== null) {
+                if (autosizeTarget === null ||
+                    previousAutosizer.id !== autosizeTarget.id) {
+                    previousAutosizer.detach(node);
+                }
+                attachToAutosizer = false;
+            }
+        }
+        if (attachToAutosizer === true) {
+            //if this is true, then the autosizer really exists
+            autosizeTarget.attach(node);
+        }
+        if (inRttCluster === true) {
+            node.markChildrenWithRTT(this);
+        }
+        children.push(node);
+        if (children.length === 1) {
+            this.zIndexMin = zIndex;
+            this.zIndexMax = zIndex;
+        }
+        else {
+            if (zIndex < this.zIndexMin) {
+                this.zIndexMin = zIndex;
+            }
+            if (zIndex > this.zIndexMax) {
+                this.zIndexMax = zIndex;
+            }
+        }
+        if (this.zIndexMax !== this.zIndexMin) {
+            this.setUpdateType(UpdateType.SortZIndexChildren);
+        }
+        this.setUpdateType(UpdateType.Children);
+        // The flat render list caches which nodes are present, so any structural
+        // change invalidates it.
+        this.stage.requestRenderListUpdate();
+    }
+    //#region Properties
+    get id() {
+        return this._id;
+    }
+    get data() {
+        return this.props.data;
+    }
+    set data(d) {
+        this.props.data = d;
+    }
+    get x() {
+        return this.props.x;
+    }
+    set x(value) {
+        if (this.props.x !== value) {
+            this.props.x = value;
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get absX() {
+        return (this.props.x +
+            -this.props.w * this.props.mountX +
+            (this.props.parent?.absX || this.props.parent?.globalTransform?.tx || 0));
+    }
+    get absY() {
+        return (this.props.y +
+            -this.props.h * this.props.mountY +
+            (this.props.parent?.absY ?? 0));
+    }
+    get y() {
+        return this.props.y;
+    }
+    set y(value) {
+        if (this.props.y !== value) {
+            this.props.y = value;
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get w() {
+        return this.props.w;
+    }
+    set w(value) {
+        const props = this.props;
+        if (props.w !== value) {
+            props.w = value;
+            let updateType = UpdateType.Local | UpdateType.RecalcUniforms;
+            if (props.texture !== null &&
+                this.stage.calculateTextureCoord === true) {
+                this.textureCoords = this.stage.renderer.getTextureCoords(this);
+            }
+            if (props.rtt === true) {
+                this.framebufferDimensions.w = value;
+                this.texture = this.stage.txManager.createTexture('RenderTexture', this.framebufferDimensions);
+                updateType |= UpdateType.RenderTexture;
+            }
+            this.setUpdateType(updateType);
+        }
+    }
+    get h() {
+        return this.props.h;
+    }
+    set h(value) {
+        const props = this.props;
+        if (props.h !== value) {
+            props.h = value;
+            let updateType = UpdateType.Local | UpdateType.RecalcUniforms;
+            if (props.texture !== null &&
+                this.stage.calculateTextureCoord === true) {
+                this.textureCoords = this.stage.renderer.getTextureCoords(this);
+            }
+            if (props.rtt === true) {
+                this.framebufferDimensions.h = value;
+                this.texture = this.stage.txManager.createTexture('RenderTexture', this.framebufferDimensions);
+                updateType |= UpdateType.RenderTexture;
+            }
+            this.setUpdateType(updateType);
+        }
+    }
+    get scale() {
+        // The CoreNode `scale` property is only used by Animations.
+        // Unlike INode, `null` should never be possibility for Animations.
+        return this.scaleX;
+    }
+    set scale(value) {
+        // The CoreNode `scale` property is only used by Animations.
+        // Unlike INode, `null` should never be possibility for Animations.
+        this.scaleX = value;
+        this.scaleY = value;
+    }
+    get scaleX() {
+        return this.props.scaleX;
+    }
+    set scaleX(value) {
+        if (this.props.scaleX !== value) {
+            this.props.scaleX = value;
+            this.updateIsSimple();
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get scaleY() {
+        return this.props.scaleY;
+    }
+    set scaleY(value) {
+        if (this.props.scaleY !== value) {
+            this.props.scaleY = value;
+            this.updateIsSimple();
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get mount() {
+        return this.props.mount;
+    }
+    set mount(value) {
+        if (this.props.mountX !== value || this.props.mountY !== value) {
+            this.props.mountX = value;
+            this.props.mountY = value;
+            this.props.mount = value;
+            this.updateIsSimple();
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get mountX() {
+        return this.props.mountX;
+    }
+    set mountX(value) {
+        if (this.props.mountX !== value) {
+            this.props.mountX = value;
+            this.updateIsSimple();
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get mountY() {
+        return this.props.mountY;
+    }
+    set mountY(value) {
+        if (this.props.mountY !== value) {
+            this.props.mountY = value;
+            this.updateIsSimple();
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get pivot() {
+        return this.props.pivot;
+    }
+    set pivot(value) {
+        if (this.props.pivotX !== value || this.props.pivotY !== value) {
+            this.props.pivotX = value;
+            this.props.pivotY = value;
+            this.props.pivot = value;
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get pivotX() {
+        return this.props.pivotX;
+    }
+    set pivotX(value) {
+        if (this.props.pivotX !== value) {
+            this.props.pivotX = value;
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get pivotY() {
+        return this.props.pivotY;
+    }
+    set pivotY(value) {
+        if (this.props.pivotY !== value) {
+            this.props.pivotY = value;
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get rotation() {
+        return this.props.rotation;
+    }
+    set rotation(value) {
+        if (this.props.rotation !== value) {
+            this.props.rotation = value;
+            this.updateIsSimple();
+            this.setUpdateType(UpdateType.Local);
+        }
+    }
+    get alpha() {
+        return this.props.alpha;
+    }
+    set alpha(value) {
+        this.props.alpha = value;
+        this.setUpdateType(UpdateType.PremultipliedColors |
+            UpdateType.WorldAlpha |
+            UpdateType.Children |
+            UpdateType.IsRenderable);
+        this.childUpdateType |= UpdateType.WorldAlpha;
+    }
+    get autosize() {
+        return this.props.autosize;
+    }
+    set autosize(value) {
+        if (this.props.autosize === value) {
+            return;
+        }
+        this.props.autosize = value;
+        if (value === true && this.autosizer === null) {
+            this.autosizer = new Autosizer(this);
+        }
+        else {
+            this.autosizer = null;
+        }
+    }
+    get boundsMargin() {
+        const props = this.props;
+        if (props.boundsMargin !== null) {
+            return props.boundsMargin;
+        }
+        const parent = this.parent;
+        if (parent !== null) {
+            const margin = parent.boundsMargin;
+            if (margin !== undefined) {
+                return margin;
+            }
+        }
+        return this.stage.boundsMargin;
+    }
+    set boundsMargin(value) {
+        if (value === this.props.boundsMargin) {
+            return;
+        }
+        if (value === null) {
+            this.props.boundsMargin = value;
+        }
+        else {
+            const bm = Array.isArray(value)
+                ? value
+                : [value, value, value, value];
+            this.props.boundsMargin = bm;
+        }
+        this.setUpdateType(UpdateType.RenderBounds);
+    }
+    get clipping() {
+        return this.props.clipping;
+    }
+    set clipping(value) {
+        this.props.clipping = value;
+        this.setUpdateType(UpdateType.Clipping | UpdateType.RenderBounds | UpdateType.Children);
+        this.childUpdateType |= UpdateType.Global | UpdateType.Clipping;
+        // Clipping toggles the stencil begin/end ops in the flat render list.
+        this.stage.requestRenderListUpdate();
+    }
+    get clipRadius() {
+        return this.props.clipRadius;
+    }
+    set clipRadius(value) {
+        if (this.props.clipRadius !== value) {
+            this.props.clipRadius = value;
+            this.setUpdateType(UpdateType.Clipping | UpdateType.RenderBounds | UpdateType.Children);
+            this.childUpdateType |= UpdateType.Global | UpdateType.Clipping;
+            // clipRadius toggles the stencil begin/end ops in the flat render list.
+            this.stage.requestRenderListUpdate();
+        }
+    }
+    get color() {
+        return this.props.color;
+    }
+    set color(value) {
+        const p = this.props;
+        if (p.color === value)
+            return;
+        p.color = value;
+        const has = value > 0;
+        this.hasColorProps = has;
+        if (p.colorTop !== value)
+            this.colorTop = value;
+        if (p.colorBottom !== value)
+            this.colorBottom = value;
+        if (p.colorLeft !== value)
+            this.colorLeft = value;
+        if (p.colorRight !== value)
+            this.colorRight = value;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorTop() {
+        return this.props.colorTop;
+    }
+    set colorTop(value) {
+        if (this.props.colorTl !== value || this.props.colorTr !== value) {
+            this.colorTl = value;
+            this.colorTr = value;
+        }
+        this.props.colorTop = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorBottom() {
+        return this.props.colorBottom;
+    }
+    set colorBottom(value) {
+        if (this.props.colorBl !== value || this.props.colorBr !== value) {
+            this.colorBl = value;
+            this.colorBr = value;
+        }
+        this.props.colorBottom = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorLeft() {
+        return this.props.colorLeft;
+    }
+    set colorLeft(value) {
+        if (this.props.colorTl !== value || this.props.colorBl !== value) {
+            this.colorTl = value;
+            this.colorBl = value;
+        }
+        this.props.colorLeft = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorRight() {
+        return this.props.colorRight;
+    }
+    set colorRight(value) {
+        if (this.props.colorTr !== value || this.props.colorBr !== value) {
+            this.colorTr = value;
+            this.colorBr = value;
+        }
+        this.props.colorRight = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorTl() {
+        return this.props.colorTl;
+    }
+    set colorTl(value) {
+        this.props.colorTl = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorTr() {
+        return this.props.colorTr;
+    }
+    set colorTr(value) {
+        this.props.colorTr = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorBl() {
+        return this.props.colorBl;
+    }
+    set colorBl(value) {
+        this.props.colorBl = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get colorBr() {
+        return this.props.colorBr;
+    }
+    set colorBr(value) {
+        this.props.colorBr = value;
+        this.hasColorProps = value > 0;
+        this.setUpdateType(UpdateType.PremultipliedColors);
+    }
+    get zIndex() {
+        return this.props.zIndex;
+    }
+    set zIndex(value) {
+        let sanitizedValue = value;
+        if (isNaN(sanitizedValue) || Number.isFinite(sanitizedValue) === false) {
+            console.warn(`zIndex was set to an invalid value: ${value}, defaulting to 0`);
+            sanitizedValue = 0;
+        }
+        //Clamp to safe integer range
+        if (sanitizedValue > Number.MAX_SAFE_INTEGER) {
+            sanitizedValue = 1000;
+        }
+        else if (sanitizedValue < Number.MIN_SAFE_INTEGER) {
+            sanitizedValue = -1000;
+        }
+        if (this.props.zIndex === sanitizedValue) {
+            return;
+        }
+        this.previousZIndex = this.props.zIndex;
+        this.props.zIndex = sanitizedValue;
+        const parent = this.parent;
+        if (parent !== null) {
+            const min = parent.zIndexMin;
+            const max = parent.zIndexMax;
+            if (min !== max || sanitizedValue < min || sanitizedValue > max) {
+                parent.setUpdateType(UpdateType.SortZIndexChildren);
+            }
+        }
+    }
+    get parent() {
+        return this.props.parent;
+    }
+    set parent(newParent) {
+        const oldParent = this.props.parent;
+        if (oldParent === newParent) {
+            return;
+        }
+        this.props.parent = newParent;
+        if (oldParent) {
+            oldParent.removeChild(this, newParent);
+        }
+        if (newParent !== null) {
+            newParent.addChild(this, oldParent);
+        }
+        // Ensure subtree no longer uses state inherited from its former ancestors.
+        this.setUpdateType(UpdateType.Global |
+            UpdateType.RenderBounds |
+            UpdateType.Clipping |
+            UpdateType.WorldAlpha);
+    }
+    get rtt() {
+        return this.props.rtt;
+    }
+    set rtt(value) {
+        if (this.props.rtt === value) {
+            return;
+        }
+        this.props.rtt = value;
+        if (value === true) {
+            this.initRenderTexture();
+            this.markChildrenWithRTT();
+        }
+        else {
+            this.cleanupRenderTexture();
+        }
+        this.setUpdateType(UpdateType.RenderTexture);
+        if (this.parentHasRenderTexture === true) {
+            this.notifyParentRTTOfUpdate();
+        }
+    }
+    initRenderTexture() {
+        this.framebufferDimensions = {
+            w: this.props.w,
+            h: this.props.h,
+        };
+        this.texture = this.stage.txManager.createTexture('RenderTexture', this.framebufferDimensions);
+        this.stage.renderer.renderToTexture(this);
+    }
+    cleanupRenderTexture() {
+        this.unloadTexture();
+        this.clearRTTInheritance();
+        this.hasRTTupdates = false;
+        this.texture = null;
+        this.framebufferDimensions = null;
+    }
+    markChildrenWithRTT(node = null) {
+        const parent = node || this;
+        for (const child of parent.children) {
+            child.setUpdateType(UpdateType.All);
+            child.parentHasRenderTexture = true;
+            child.markChildrenWithRTT();
+        }
+    }
+    // Apply RTT inheritance when a node has an RTT-enabled parent
+    applyRTTInheritance(parent) {
+        if (parent.rtt) {
+            // Only the RTT node should be added to `renderToTexture`
+            parent.setUpdateType(UpdateType.RenderTexture);
+        }
+        // Propagate `parentHasRenderTexture` downwards
+        this.markChildrenWithRTT(parent);
+    }
+    // Clear RTT inheritance when detaching from an RTT chain
+    clearRTTInheritance() {
+        // if this node is RTT itself stop the propagation important for nested RTT nodes
+        // for the initial RTT node this is already handled in `set rtt`
+        if (this.rtt) {
+            return;
+        }
+        for (const child of this.children) {
+            // force child to update everything as the RTT inheritance has changed
+            child.parentHasRenderTexture = false;
+            child.rttParent = null;
+            child.setUpdateType(UpdateType.All);
+            child.clearRTTInheritance();
+        }
+    }
+    get shader() {
+        return this.props.shader;
+    }
+    set shader(shader) {
+        if (this.props.shader === shader) {
+            return;
+        }
+        if (shader === null) {
+            this.hasShaderUpdater = this.hasShaderTimeFn = false;
+            this.props.shader = this.stage.defShaderNode;
+            this.setUpdateType(UpdateType.IsRenderable);
+            return;
+        }
+        this.hasShaderUpdater = shader.update !== undefined;
+        this.hasShaderTimeFn = shader.time !== undefined;
+        if (shader.shaderKey !== 'default') {
+            shader.attachNode(this);
+        }
+        if (this.hasShaderTimeFn === true) {
+            this.stage.trackTimedNode(this);
+        }
+        else {
+            this.stage.untrackTimedNode(this);
+        }
+        this.props.shader = shader;
+        this.setUpdateType(UpdateType.IsRenderable | UpdateType.RecalcUniforms);
+    }
+    get src() {
+        return this.props.src;
+    }
+    set src(imageUrl) {
+        if (this.props.src === imageUrl) {
+            return;
+        }
+        this.props.src = imageUrl;
+        if (!imageUrl) {
+            this.texture = null;
+            return;
+        }
+        this.texture = this.stage.txManager.createTexture('ImageTexture', {
+            src: imageUrl,
+            w: this.props.w,
+            h: this.props.h,
+            type: this.props.imageType,
+            sx: this.props.srcX,
+            sy: this.props.srcY,
+            sw: this.props.srcWidth,
+            sh: this.props.srcHeight,
+        });
+    }
+    set imageType(type) {
+        if (this.props.imageType === type) {
+            return;
+        }
+        this.props.imageType = type;
+    }
+    get imageType() {
+        return this.props.imageType || null;
+    }
+    get srcHeight() {
+        return this.props.srcHeight;
+    }
+    set srcHeight(value) {
+        this.props.srcHeight = value;
+    }
+    get srcWidth() {
+        return this.props.srcWidth;
+    }
+    set srcWidth(value) {
+        this.props.srcWidth = value;
+    }
+    get srcX() {
+        return this.props.srcX;
+    }
+    set srcX(value) {
+        this.props.srcX = value;
+    }
+    get srcY() {
+        return this.props.srcY;
+    }
+    set srcY(value) {
+        this.props.srcY = value;
+    }
+    /**
+     * Returns the framebuffer dimensions of the RTT parent
+     */
+    get parentFramebufferDimensions() {
+        if (this.rttParent !== null) {
+            return this.rttParent.framebufferDimensions;
+        }
+        this.rttParent = this.findParentRTTNode();
+        return this.rttParent ? this.rttParent.framebufferDimensions : null;
+    }
+    /**
+     * Returns the parent render texture node if it exists.
+     */
+    get parentRenderTexture() {
+        let parent = this.parent;
+        while (parent) {
+            if (parent.rtt) {
+                return parent;
+            }
+            parent = parent.parent;
+        }
+        return null;
+    }
+    get texture() {
+        return this.props.texture;
+    }
+    set texture(value) {
+        if (this.props.texture === value) {
+            return;
+        }
+        const oldTexture = this.props.texture;
+        if (oldTexture) {
+            this.unloadTexture();
+            if (this.autosizer !== null && value === null) {
+                this.autosizer.setMode(AutosizeMode.Children); // Set to children size mode
+            }
+        }
+        this.textureCoords = undefined;
+        this.props.texture = value;
+        if (value !== null) {
+            if (this.autosizer !== null) {
+                this.autosizer.setMode(AutosizeMode.Texture); // Set to texture size mode
+            }
+            value.setRenderableOwner(this._id, this.isRenderable);
+            this.loadTexture();
+        }
+        this.setUpdateType(UpdateType.IsRenderable);
+        if (this.stage.options.enableDirtyRepaints === true) {
+            this.isQuadDirty = true;
+        }
+        this.updateIsSimple();
+    }
+    set textureOptions(value) {
+        this.props.textureOptions = value;
+        if (this.stage.calculateTextureCoord === true) {
+            this.textureCoords = this.stage.renderer.getTextureCoords(this);
+        }
+        this.updateIsSimple();
+    }
+    get textureOptions() {
+        return this.props.textureOptions;
+    }
+    set interactive(value) {
+        this.props.interactive = value;
+        // Update Stage's interactive Set
+        if (value === true) {
+            this.stage.interactiveNodes.add(this);
+        }
+        else {
+            // Ensure the node is removed when interactivity is turned off/unset,
+            // otherwise it stays pinned in the Set and leaks.
+            this.stage.interactiveNodes.delete(this);
+        }
+    }
+    get interactive() {
+        return this.props.interactive;
+    }
+    setRTTUpdates(type) {
+        this.hasRTTupdates = true;
+        this.parent?.setRTTUpdates(type);
+    }
+    animate(props, settings) {
+        return this.stage.animationManager.createAnimation(this, props, settings);
+    }
+    flush() {
+        // no-op
+    }
+    /**
+     * Add a texture to the current RenderOp.
+     *
+     * @param texture
+     * @returns Assigned Texture Index of the texture in the render op
+     */
+    addTexture(texture) {
+        const textures = this.renderOpTextures;
+        const length = textures.length;
+        for (let i = 0; i < length; i++) {
+            if (textures[i] === texture) {
+                return i;
+            }
+        }
+        if (length >= 1) {
+            return 0xffffffff;
+        }
+        textures.push(texture);
+        return length;
+    }
+    draw(renderer) {
+        const { glw, stage } = renderer;
+        const canvas = stage.platform.canvas;
+        const shader = this.props.shader;
+        stage.shManager.useShader(shader.program);
+        shader.program.bindRenderOp(this);
+        // Clipping
+        if (this.clippingRect.valid === true) {
+            const pixelRatio = this.parentHasRenderTexture ? 1 : stage.pixelRatio;
+            const clipX = Math.round(this.clippingRect.x * pixelRatio);
+            const clipWidth = Math.round(this.clippingRect.w * pixelRatio);
+            const clipHeight = Math.round(this.clippingRect.h * pixelRatio);
+            let clipY = Math.round(canvas.height - clipHeight - this.clippingRect.y * pixelRatio);
+            // if parent has render texture, we need to adjust the scissor rect
+            // to be relative to the parent's framebuffer
+            if (this.parentHasRenderTexture) {
+                const parentFramebufferDimensions = this.parentFramebufferDimensions;
+                clipY =
+                    parentFramebufferDimensions !== null
+                        ? parentFramebufferDimensions.h - this.props.h
+                        : 0;
+            }
+            glw.setScissorTest(true);
+            glw.scissor(clipX, clipY, clipWidth, clipHeight);
+        }
+        else {
+            glw.setScissorTest(false);
+        }
+        const quadIdx = (this.renderOpBufferIdx / (QUAD_VERTEX_STRIDE * 4)) * 6 * 2;
+        glw.drawElements(glw.TRIANGLES, 6 * this.numQuads, glw.UNSIGNED_SHORT, quadIdx);
+    }
+}
+//# sourceMappingURL=CoreNode.js.map

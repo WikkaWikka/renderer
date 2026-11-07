@@ -1,0 +1,62 @@
+/*
+ * If not stated otherwise in this file or this component's LICENSE file the
+ * following copyright and licenses apply:
+ *
+ * Copyright 2026 Comcast Cable Communications Management, LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import { WebPlatform } from './WebPlatform.js';
+import { createImageWorkerNoOptions } from './lib/ImageWorkerNoOptions.js';
+/**
+ * Chrome 50 Web Platform implementation with limited createImageBitmap support
+ *
+ * @remarks
+ * This platform is designed for Chrome 50 and similar browsers that support
+ * createImageBitmap but with a limited signature (no options or cropping parameters).
+ *
+ * Limitations:
+ * - createImageBitmap is called without options (premultiplyAlpha, colorSpaceConversion, imageOrientation)
+ * - Image cropping (sx, sy, sw, sh parameters) is not supported
+ * - Image workers can still be used if enabled via settings
+ */
+export class WebPlatformChrome50 extends WebPlatform {
+    getImageWorkerFactory() {
+        return createImageWorkerNoOptions;
+    }
+    async createImage(blob, 
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    premultiplyAlpha, 
+    // Cropping parameters are not supported in Chrome 50
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sx, 
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sy, 
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sw, 
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    sh) {
+        // Chrome 50 createImageBitmap signature: createImageBitmap(blob)
+        // No options or cropping parameters supported
+        const bitmap = await createImageBitmap(blob);
+        // The bitmap was created without a premultiplyAlpha option so the browser
+        // decides whether to premultiply. On older WPEWebKit the default is
+        // straight alpha, so we mark premultiplied: false here to signal
+        // that UNPACK_PREMULTIPLY_ALPHA_WEBGL should be set at upload time.
+        return {
+            data: bitmap,
+            premultiplied: false,
+        };
+    }
+}
+//# sourceMappingURL=WebPlatformChrome50.js.map

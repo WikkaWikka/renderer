@@ -1,0 +1,125 @@
+/*
+ * If not stated otherwise in this file or this component's LICENSE file the
+ * following copyright and licenses apply:
+ *
+ * Copyright 2023 Comcast Cable Communications Management, LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**
+ * Get device specific webgl parameters
+ * @param glw
+ */
+export function getWebGlParameters(glw) {
+    const params = {
+        MAX_RENDERBUFFER_SIZE: 0,
+        MAX_TEXTURE_SIZE: 0,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any
+        MAX_VIEWPORT_DIMS: 0, // Code below will replace this with an Int32Array
+        MAX_VERTEX_TEXTURE_IMAGE_UNITS: 0,
+        MAX_TEXTURE_IMAGE_UNITS: 0,
+        MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0,
+        MAX_VERTEX_ATTRIBS: 0,
+        MAX_VARYING_VECTORS: 0,
+        MAX_VERTEX_UNIFORM_VECTORS: 0,
+        MAX_FRAGMENT_UNIFORM_VECTORS: 0,
+    };
+    // Map over all parameters and get them
+    const keys = Object.keys(params);
+    keys.forEach((key) => {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        params[key] = glw.getParameter(glw[key]);
+    });
+    return params;
+}
+/**
+ * Get device webgl extensions
+ * @param glw
+ */
+export function getWebGlExtensions(glw) {
+    const extensions = {
+        ANGLE_instanced_arrays: null,
+        WEBGL_compressed_texture_s3tc: null,
+        WEBGL_compressed_texture_astc: null,
+        WEBGL_compressed_texture_etc: null,
+        WEBGL_compressed_texture_etc1: null,
+        WEBGL_compressed_texture_pvrtc: null,
+        WEBKIT_WEBGL_compressed_texture_pvrtc: null,
+        WEBGL_compressed_texture_s3tc_srgb: null,
+        OES_vertex_array_object: null,
+    };
+    // Map over all extensions and get them
+    const keys = Object.keys(extensions);
+    keys.forEach((key) => {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        extensions[key] = glw.getExtension(key);
+    });
+    return extensions;
+}
+/**
+ * The number of quads the shared element index buffer can address.
+ *
+ * Indices are stored as `Uint16`, and quad `n` references vertices
+ * `4n .. 4n + 3`. The highest representable vertex index is 65535, so at most
+ * `65536 / 4 = 16384` quads can be indexed, regardless of how much buffer
+ * memory is configured.
+ */
+const MAX_INDEXABLE_QUADS = 16384;
+/**
+ * Number of quads that can be drawn from the shared index buffer for a given
+ * buffer memory budget.
+ *
+ * @param bufferMemory
+ */
+export function getMaxQuads(bufferMemory) {
+    return Math.min(~~(bufferMemory / 80), MAX_INDEXABLE_QUADS);
+}
+/**
+ * Allocate big memory chunk that we
+ * can re-use to draw quads
+ *
+ * @param glw
+ * @param size
+ */
+export function createIndexBuffer(glw, size) {
+    const maxQuads = getMaxQuads(size);
+    const indices = new Uint16Array(maxQuads * 6);
+    for (let quad = 0; quad < maxQuads; quad++) {
+        const i = quad * 6;
+        const j = quad * 4;
+        indices[i] = j;
+        indices[i + 1] = j + 1;
+        indices[i + 2] = j + 2;
+        indices[i + 3] = j + 2;
+        indices[i + 4] = j + 1;
+        indices[i + 5] = j + 3;
+    }
+    const buffer = glw.createBuffer();
+    glw.elementArrayBufferData(buffer, indices, glw.STATIC_DRAW);
+}
+/**
+ * Checks if an object is of type HTMLImageElement.
+ * This is used because we cant check for HTMLImageElement directly when the
+ * renderer is running in a seperate web worker context.
+ *
+ * @param obj
+ * @returns
+ */
+export function isHTMLImageElement(obj) {
+    return (obj !== null &&
+        ((typeof obj === 'object' &&
+            obj.constructor &&
+            obj.constructor.name === 'HTMLImageElement') ||
+            (typeof Image !== 'undefined' && obj instanceof Image)));
+}
+//# sourceMappingURL=RendererUtils.js.map

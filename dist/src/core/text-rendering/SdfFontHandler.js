@@ -1,0 +1,445 @@
+/*
+ * If not stated otherwise in this file or this component's LICENSE file the
+ * following copyright and licenses apply:
+ *
+ * Copyright 2025 Comcast Cable Communications Management, LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import { UpdateType } from '../CoreNode.js';
+import { hasZeroWidthSpace } from './Utils.js';
+import { normalizeFontMetrics } from './TextLayoutEngine.js';
+//global state variables for SdfFontHandler
+const fontCache = new Map();
+const fontLoadPromises = new Map();
+/**
+ * Registered font configurations.
+ *
+ * @remarks
+ * Registration (via `loadFont`) only stores where to find the font. The
+ * atlas fetch/decode/upload starts on first use (`requestLoad`) or explicit
+ * `preloadFont`, so fonts that are never rendered cost nothing.
+ */
+const fontConfigs = new Map();
+const normalizedMetrics = new Map();
+const nodesWaitingForFont = Object.create(null);
+let initialized = false;
+/**
+ * Build kerning lookup table for fast access
+ * @param {Array} kernings - Kerning data from font
+ * @returns {KerningTable} Optimized kerning lookup table
+ */
+const buildKerningTable = (kernings) => {
+    const kerningTable = {};
+    let i = 0;
+    const length = kernings.length;
+    while (i < length) {
+        const kerning = kernings[i];
+        i++;
+        if (kerning === undefined) {
+            continue;
+        }
+        const second = kerning.second;
+        let firsts = kerningTable[second];
+        if (firsts === undefined) {
+            firsts = {};
+            kerningTable[second] = firsts;
+        }
+        firsts[kerning.first] = kerning.amount;
+    }
+    return kerningTable;
+};
+/**
+ * Build glyph map from font data for fast character lookup
+ * @param {Array} chars - Character data from font
+ * @returns {Map} Glyph map for character to glyph lookup
+ */
+const buildGlyphMap = (chars) => {
+    const glyphMap = new Map();
+    let maxCharHeight = 0;
+    let i = 0;
+    const length = chars.length;
+    while (i < length) {
+        const glyph = chars[i];
+        i++;
+        if (glyph === undefined) {
+            continue;
+        }
+        glyphMap.set(glyph.id, glyph);
+        const charHeight = glyph.yoffset + glyph.height;
+        if (charHeight > maxCharHeight) {
+            maxCharHeight = charHeight;
+        }
+    }
+    return glyphMap;
+};
+/**
+ * Process font data and create optimized cache entry
+ * @param {string} fontFamily - Font family name
+ * @param {SdfFontData} fontData - Raw font data
+ * @param {ImageTexture} atlasTexture - Atlas texture
+ * @param {FontMetrics} metrics - Font metrics
+ */
+const processFontData = (fontFamily, fontData, atlasTexture, metrics) => {
+    // Build optimized data structures
+    const glyphMap = buildGlyphMap(fontData.chars);
+    const kernings = buildKerningTable(fontData.kernings);
+    // Calculate max char height
+    let maxCharHeight = 0;
+    let i = 0;
+    const length = fontData.chars.length;
+    while (i < length) {
+        const glyph = fontData.chars[i];
+        if (glyph !== undefined) {
+            const charHeight = glyph.yoffset + glyph.height;
+            if (charHeight > maxCharHeight) {
+                maxCharHeight = charHeight;
+            }
+        }
+        i++;
+    }
+    if (metrics === undefined && fontData.lightningMetrics === undefined) {
+        console.warn(`Font metrics not found for SDF font ${fontFamily}. ` +
+            'Make sure you are using the latest version of the Lightning ' +
+            '3 msdf-generator tool to generate your SDF fonts. Using default metrics.');
+    }
+    metrics = metrics ||
+        fontData.lightningMetrics || {
+        ascender: 800,
+        descender: -200,
+        lineGap: 200,
+        unitsPerEm: 1000,
+    };
+    // Cache processed data
+    fontCache.set(fontFamily, {
+        data: fontData,
+        glyphMap,
+        kernings,
+        atlasTexture,
+        metrics,
+        maxCharHeight,
+    });
+};
+/**
+ * Check if the SDF font handler can render a font
+ * @param {TrProps} trProps - Text rendering properties
+ * @returns {boolean} True if the font can be rendered
+ */
+export const canRenderFont = (trProps) => {
+    return (isFontLoaded(trProps.fontFamily) ||
+        fontLoadPromises.has(trProps.fontFamily) ||
+        fontConfigs.has(trProps.fontFamily));
+};
+/**
+ * Register an SDF font from JSON + PNG atlas.
+ *
+ * @remarks
+ * Registration only stores where to find the font — no fetch, decode, or
+ * GPU upload happens here. Loading starts on first use (see
+ * {@link requestLoad}) or explicit {@link preloadFont}, so registered fonts
+ * that are never rendered cost nothing.
+ *
+ * @param {Object} options - Font loading options
+ * @param {string} options.fontFamily - Font family name
+ * @param {string} options.fontUrl - JSON font data URL (atlasDataUrl)
+ * @param {string} options.atlasUrl - PNG atlas texture URL
+ * @param {FontMetrics} options.metrics - Optional font metrics
+ */
+export const loadFont = async (_stage, options) => {
+    const { fontFamily, atlasUrl, atlasDataUrl, metrics } = options;
+    // Early return if already loaded
+    if (fontCache.get(fontFamily) !== undefined) {
+        return;
+    }
+    if (atlasDataUrl === undefined) {
+        throw new Error(`Atlas data URL must be provided for SDF font: ${fontFamily}`);
+    }
+    // Atlas texture should be provided externally
+    if (!atlasUrl) {
+        throw new Error('Atlas texture must be provided for SDF fonts');
+    }
+    fontConfigs.set(fontFamily, { atlasUrl, atlasDataUrl, metrics });
+};
+/**
+ * Eagerly load a previously registered (or new) SDF font.
+ *
+ * @remarks
+ * Use when first-paint readiness must be guaranteed (e.g. awaited before
+ * drawing). Unlike {@link loadFont}, this resolves only after the atlas is
+ * decoded, uploaded, and processed.
+ */
+export const preloadFont = async (stage, options) => {
+    await loadFont(stage, options);
+    await ensureLoaded(stage, options.fontFamily);
+};
+/**
+ * Start loading a registered font if it hasn't started yet.
+ *
+ * @remarks
+ * Cheap and idempotent: map lookups plus promise dedup. Called on first use
+ * (node creation / update ticks) so the first text node warms its own font.
+ * Load failures are logged; waiting nodes behave as before.
+ */
+export const requestLoad = (stage, fontFamily) => {
+    if (fontConfigs.has(fontFamily) === true &&
+        fontCache.has(fontFamily) === false &&
+        fontLoadPromises.has(fontFamily) === false) {
+        ensureLoaded(stage, fontFamily).catch((error) => {
+            console.error(`Failed to load SDF font: ${fontFamily}`, error);
+        });
+    }
+};
+/**
+ * Fetch, decode, upload, and process a registered SDF font.
+ */
+const ensureLoaded = (stage, fontFamily) => {
+    // Early return if already loaded
+    if (fontCache.get(fontFamily) !== undefined) {
+        return Promise.resolve();
+    }
+    // Early return if already loading
+    const existingPromise = fontLoadPromises.get(fontFamily);
+    if (existingPromise !== undefined) {
+        return existingPromise;
+    }
+    const config = fontConfigs.get(fontFamily);
+    if (config === undefined) {
+        return Promise.reject(new Error(`SDF font not registered: ${fontFamily}`));
+    }
+    const { atlasUrl, atlasDataUrl, metrics } = config;
+    const nwff = (nodesWaitingForFont[fontFamily] ||= []);
+    // Create loading promise
+    const loadPromise = (async () => {
+        // Load font JSON data
+        const response = await fetch(atlasDataUrl);
+        if (!response.ok) {
+            throw new Error(`Failed to load font data: ${response.statusText}`);
+        }
+        const fontData = (await response.json());
+        if (!fontData || !fontData.chars) {
+            throw new Error('Invalid SDF font data format');
+        }
+        // Wait for atlas texture to load
+        return new Promise((resolve, reject) => {
+            // create new atlas texture using ImageTexture
+            const atlasTexture = stage.txManager.createTexture('ImageTexture', {
+                src: atlasUrl,
+                premultiplyAlpha: false,
+            });
+            atlasTexture.setRenderableOwner(fontFamily, true);
+            atlasTexture.preventCleanup = true; // Prevent automatic cleanup
+            if (atlasTexture.state === 'loaded') {
+                // If already loaded, process immediately
+                processFontData(fontFamily, fontData, atlasTexture, metrics);
+                fontLoadPromises.delete(fontFamily);
+                for (let key in nwff) {
+                    nwff[key].setUpdateType(UpdateType.Local);
+                }
+                delete nodesWaitingForFont[fontFamily];
+                return resolve();
+            }
+            atlasTexture.on('loaded', () => {
+                // Process and cache font data
+                processFontData(fontFamily, fontData, atlasTexture, metrics);
+                // remove from promises
+                fontLoadPromises.delete(fontFamily);
+                for (let key in nwff) {
+                    nwff[key].setUpdateType(UpdateType.Local);
+                }
+                delete nodesWaitingForFont[fontFamily];
+                resolve();
+            });
+            atlasTexture.on('failed', (_target, error) => {
+                // Cleanup on error
+                if (fontCache[fontFamily]) {
+                    delete fontCache[fontFamily];
+                }
+                reject(error);
+            });
+        });
+    })().catch((error) => {
+        fontLoadPromises.delete(fontFamily);
+        console.error(`Failed to load SDF font: ${fontFamily}`, error);
+        throw error;
+    });
+    fontLoadPromises.set(fontFamily, loadPromise);
+    return loadPromise;
+};
+/**
+ * Stop waiting for a font to load
+ * @param {string} fontFamily - Font family name
+ * @param {CoreTextNode} node - Node that was waiting for the font
+ */
+export const waitingForFont = (fontFamily, node) => {
+    if (nodesWaitingForFont[fontFamily] === undefined) {
+        return;
+    }
+    nodesWaitingForFont[fontFamily][node.id] = node;
+};
+/**
+ * Stop waiting for a font to load
+ *
+ * @param fontFamily
+ * @param node
+ * @returns
+ */
+export const stopWaitingForFont = (fontFamily, node) => {
+    if (nodesWaitingForFont[fontFamily] === undefined) {
+        return;
+    }
+    delete nodesWaitingForFont[fontFamily][node.id];
+};
+/**
+ * Get the font families map for resolving fonts
+ */
+export const getFontFamilies = () => {
+    const families = {};
+    // SDF fonts don't use the traditional FontFamilyMap structure
+    // Return empty map since SDF fonts are handled differently
+    return families;
+};
+/**
+ * Initialize the SDF font handler
+ */
+export const init = (_c) => {
+    if (initialized === true) {
+        return;
+    }
+    initialized = true;
+};
+export const type = 'sdf';
+/**
+ * Check if a font is already loaded by font family
+ */
+export const isFontLoaded = (fontFamily) => {
+    return fontCache.has(fontFamily);
+};
+/**
+ * Get normalized font metrics for a font family
+ */
+export const getFontMetrics = (fontFamily, fontSize) => {
+    const out = normalizedMetrics.get(fontFamily);
+    if (out !== undefined) {
+        return out;
+    }
+    let metrics = fontCache.get(fontFamily).metrics;
+    return processFontMetrics(fontFamily, fontSize, metrics);
+};
+export const processFontMetrics = (fontFamily, fontSize, metrics) => {
+    const label = fontFamily + fontSize;
+    const normalized = normalizeFontMetrics(metrics, fontSize);
+    normalizedMetrics.set(label, normalized);
+    return normalized;
+};
+/**
+ * Get glyph data for a character in a specific font
+ * @param {string} fontFamily - Font family name
+ * @param {number} codepoint - Character codepoint
+ * @returns {Object|null} Glyph data or null if not found
+ */
+export const getGlyph = (fontFamily, codepoint) => {
+    const cache = fontCache.get(fontFamily);
+    if (cache === undefined)
+        return null;
+    return cache.glyphMap.get(codepoint) || cache.glyphMap.get(63) || null; // 63 = '?'
+};
+/**
+ * Get kerning value between two glyphs
+ * @param {string} fontFamily - Font family name
+ * @param {number} firstGlyph - First glyph ID
+ * @param {number} secondGlyph - Second glyph ID
+ * @returns {number} Kerning value or 0
+ */
+export const getKerning = (fontFamily, firstGlyph, secondGlyph) => {
+    const cache = fontCache.get(fontFamily);
+    if (cache === undefined)
+        return 0;
+    const seconds = cache.kernings[secondGlyph];
+    return seconds ? seconds[firstGlyph] || 0 : 0;
+};
+/**
+ * Get atlas texture for a font family
+ * @param {string} fontFamily - Font family name
+ * @returns {ImageTexture|null} Atlas texture or null
+ */
+export const getAtlas = (fontFamily) => {
+    const cache = fontCache.get(fontFamily);
+    return cache !== undefined ? cache.atlasTexture : null;
+};
+/**
+ * Get font data for a font family
+ * @param {string} fontFamily - Font family name
+ * @returns {SdfFontData|null} Font data or null
+ */
+export const getFontData = (fontFamily) => {
+    return fontCache.get(fontFamily);
+};
+/**
+ * Get maximum character height for a font family
+ * @param {string} fontFamily - Font family name
+ * @returns {number} Max character height or 0
+ */
+export const getMaxCharHeight = (fontFamily) => {
+    const cache = fontCache.get(fontFamily);
+    return cache !== undefined ? cache.maxCharHeight : 0;
+};
+/**
+ * Get all loaded font families
+ * @returns {string[]} Array of font family names
+ */
+export const getLoadedFonts = () => {
+    return Array.from(fontCache.keys());
+};
+/**
+ * Unload a font and free resources
+ * @param {string} fontFamily - Font family name
+ */
+export const unloadFont = (fontFamily) => {
+    const cache = fontCache.get(fontFamily);
+    if (cache !== undefined) {
+        // Free texture if needed
+        if (typeof cache.atlasTexture.free === 'function') {
+            cache.atlasTexture.free();
+        }
+        fontCache.delete(fontFamily);
+    }
+};
+export const measureText = (text, fontFamily, letterSpacing) => {
+    if (text.length === 0)
+        return 0;
+    let width = 0;
+    let prevGlyphId = 0;
+    for (const char of text) {
+        const codepoint = char.codePointAt(0);
+        if (codepoint === undefined) {
+            continue;
+        }
+        // Skip zero-width spaces in width calculations
+        if (hasZeroWidthSpace(char)) {
+            continue;
+        }
+        const glyph = getGlyph(fontFamily, codepoint);
+        if (glyph === null)
+            continue;
+        let advance = glyph.xadvance;
+        // Add kerning if there's a previous character
+        if (prevGlyphId !== 0) {
+            const kerning = getKerning(fontFamily, prevGlyphId, glyph.id);
+            advance += kerning;
+        }
+        width += advance + letterSpacing;
+        prevGlyphId = glyph.id;
+    }
+    return width;
+};
+//# sourceMappingURL=SdfFontHandler.js.map

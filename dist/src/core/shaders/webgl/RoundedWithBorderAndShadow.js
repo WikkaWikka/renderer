@@ -1,0 +1,223 @@
+/*
+ * Copyright 2023 Comcast Cable Communications Management, LLC
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+import { calcFactoredRadiusArray } from '../../lib/utils.js';
+import { RoundedWithBorderAndShadowTemplate, } from '../templates/RoundedWithBorderAndShadowTemplate.js';
+export const RoundedWithBorderAndShadow = {
+    props: RoundedWithBorderAndShadowTemplate.props,
+    update(node) {
+        const props = this.props;
+        this.uniformRGBA('u_borderColor', props['border-color']);
+        this.uniform4fa('u_borderWidth', props['border-w']);
+        this.uniform1f('u_borderGap', this.props['border-gap']);
+        this.uniform1f('u_borderAlign', this.props['border-align']);
+        this.uniformRGBA('u_shadowColor', props['shadow-color']);
+        this.uniform4fa('u_shadow', props['shadow-projection']);
+        this.uniform4fa('u_radius', calcFactoredRadiusArray(props.radius, node.w, node.h));
+    },
+    vertex: `
+    # ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    # else
+    precision mediump float;
+    # endif
+
+    attribute vec2 a_position;
+    attribute vec2 a_textureCoords;
+    attribute vec4 a_color;
+    attribute vec2 a_nodeCoords;
+
+    uniform vec2 u_resolution;
+    uniform float u_pixelRatio;
+    uniform float u_rtt;
+    uniform vec2 u_dimensions;
+
+    uniform vec4 u_shadow;
+    uniform vec4 u_radius;
+    uniform vec4 u_borderWidth;
+    uniform float u_borderGap;
+    uniform float u_borderAlign;
+
+    varying vec4 v_color;
+    varying vec2 v_textureCoords;
+    varying vec2 v_nodeCoords;
+
+    varying vec2 v_innerSize;
+    varying vec2 v_outerSize;
+    varying vec2 v_outerBorderUv;
+    varying vec2 v_innerBorderUv;
+    varying vec4 v_innerBorderRadius;
+    varying vec4 v_outerBorderRadius;
+    varying vec2 v_halfDimensions;
+
+    void main() {
+      vec2 screenSpace = vec2(2.0 / u_resolution.x,  -2.0 / u_resolution.y);
+      vec2 edge = clamp(a_nodeCoords * 2.0 - vec2(1.0), -1.0, 1.0);
+      float borderZero = 1.0 - step(0.001, dot(abs(u_borderWidth), vec4(1.0)));
+
+      vec2 edgeOffset = edge * ((u_shadow.w * 2.0)+ u_shadow.z) + u_shadow.xy;
+      vec2 vertexPos = (a_position + edge + edgeOffset) * u_pixelRatio;
+
+      v_innerSize = vec2(0.0);
+      v_outerSize = vec2(0.0);
+
+      // Compute all border values unconditionally — edgeOffset extra is masked by
+      // (1.0 - borderZero) so geometry is unaffected when no border is present.
+      vec4 adjustedBorderWidth = u_borderWidth - 1.0 + clamp(u_borderWidth, -1.0, 1.0);
+
+      float borderTop = adjustedBorderWidth.x;
+      float borderRight = adjustedBorderWidth.y;
+      float borderBottom = adjustedBorderWidth.z;
+      float borderLeft = adjustedBorderWidth.w;
+
+      v_outerBorderUv = vec2(0.0);
+      v_innerBorderUv = vec2(0.0);
+
+      vec2 borderSize = vec2(borderRight + borderLeft, borderTop + borderBottom);
+      vec2 extraSize = borderSize * u_borderAlign;
+      float gapLeft = step(0.001, borderLeft) * u_borderGap;
+      float gapRight = step(0.001, borderRight) * u_borderGap;
+      float gapTop = step(0.001, borderTop) * u_borderGap;
+      float gapBottom = step(0.001, borderBottom) * u_borderGap;
+      vec2 gapSize = vec2(gapLeft + gapRight, gapTop + gapBottom);
+
+      v_outerSize = (u_dimensions + gapSize + extraSize) * 0.5;
+      v_innerSize = v_outerSize - borderSize * 0.5;
+
+      // Use sign() to avoid branching
+      vec2 borderDiff = vec2(borderRight - borderLeft, borderBottom - borderTop);
+      vec2 signDiff = sign(borderDiff);
+      borderDiff = abs(borderDiff);
+
+      vec2 gapDiff = vec2(gapRight - gapLeft, gapBottom - gapTop);
+      vec2 signGapDiff = sign(gapDiff);
+      gapDiff = abs(gapDiff);
+
+      v_outerBorderUv = -signDiff * borderDiff * u_borderAlign * 0.5 - signGapDiff * gapDiff * 0.5;
+      v_innerBorderUv = v_outerBorderUv + signDiff * borderDiff * 0.5;
+
+      v_outerBorderRadius = vec4(
+        max(0.0, u_radius.x + max(borderTop * u_borderAlign + u_borderGap, borderLeft * u_borderAlign + u_borderGap)),
+        max(0.0, u_radius.y + max(borderTop * u_borderAlign + u_borderGap, borderRight * u_borderAlign + u_borderGap)),
+        max(0.0, u_radius.z + max(borderBottom * u_borderAlign + u_borderGap, borderRight * u_borderAlign + u_borderGap)),
+        max(0.0, u_radius.w + max(borderBottom * u_borderAlign + u_borderGap, borderLeft * u_borderAlign + u_borderGap))
+      );
+
+      v_innerBorderRadius = vec4(
+        max(0.0, v_outerBorderRadius.x - max(borderTop, borderLeft)),
+        max(0.0, v_outerBorderRadius.y - max(borderTop, borderRight)),
+        max(0.0, v_outerBorderRadius.z - max(borderBottom, borderRight)),
+        max(0.0, v_outerBorderRadius.w - max(borderBottom, borderLeft))
+      );
+
+      vec2 edgeOffsetExtra = step(u_dimensions * 0.5, v_outerSize) * edge * (extraSize + u_borderGap);
+      // Mask extra border offset to zero when no border — replaces if(borderZero == 0.0).
+      edgeOffset += edgeOffsetExtra * (1.0 - borderZero);
+
+      vertexPos = (a_position + edge + edgeOffset) * u_pixelRatio;
+
+      gl_Position = vec4(vertexPos.x * screenSpace.x - 1.0, -sign(screenSpace.y) * (vertexPos.y * -abs(screenSpace.y)) + 1.0, 0.0, 1.0);
+
+      v_halfDimensions = u_dimensions * 0.5;
+      v_color = a_color;
+      v_nodeCoords = a_nodeCoords + (screenSpace + edgeOffset) / (u_dimensions);
+      v_textureCoords = a_textureCoords + (screenSpace + edgeOffset) / (u_dimensions);
+    }
+  `,
+    fragment: `
+    # ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    # else
+    precision mediump float;
+    # endif
+
+    uniform vec2 u_resolution;
+    uniform float u_pixelRatio;
+    uniform float u_alpha;
+    uniform vec2 u_dimensions;
+    uniform sampler2D u_texture;
+    uniform float u_rtt;
+
+    uniform vec4 u_radius;
+    uniform vec4 u_borderWidth;
+    uniform vec4 u_borderColor;
+    uniform vec4 u_shadowColor;
+    uniform vec4 u_shadow;
+
+    varying vec4 v_color;
+    varying vec2 v_textureCoords;
+    varying vec2 v_nodeCoords;
+
+    varying vec2 v_innerSize;
+    varying vec2 v_outerSize;
+    varying vec2 v_outerBorderUv;
+    varying vec2 v_innerBorderUv;
+    varying vec4 v_innerBorderRadius;
+    varying vec4 v_outerBorderRadius;
+    varying vec2 v_halfDimensions;
+
+    float roundedBox(vec2 p, vec2 s, vec4 r) {
+      float sx = step(0.0, p.x);
+      float sy = step(0.0, p.y);
+      r.xy = mix(r.xw, r.yz, sx);
+      r.x = mix(r.x, r.y, sy);
+      vec2 q = abs(p) - s + r.x;
+      return (min(max(q.x, q.y), 0.0) + length(max(q, 0.0))) - r.x;
+    }
+
+    float shadowBox(vec2 p, vec2 s, vec4 r) {
+      float sx = step(0.0, p.x);
+      float sy = step(0.0, p.y);
+      r.xy = mix(r.xw, r.yz, sx);
+      r.x = mix(r.x, r.y, sy);
+      vec2 q = abs(p) - s + r.x;
+      float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r.x;
+      return 1.0 - smoothstep(-u_shadow.w, u_shadow.w + u_shadow.z, dist);
+    }
+
+    void main() {
+      vec4 color = texture2D(u_texture, v_textureCoords) * v_color;
+      vec4 resultColor = vec4(0.0);
+      vec2 boxUv = v_nodeCoords.xy * u_dimensions - v_halfDimensions;
+      float borderZero = 1.0 - step(0.001, dot(abs(u_borderWidth), vec4(1.0)));
+      float edgeWidth = 1.0 / u_pixelRatio;
+      float nodeDist = roundedBox(boxUv, v_halfDimensions - edgeWidth, u_radius);
+      float nodeAlpha = 1.0 - smoothstep(-0.5 * edgeWidth, 0.5 * edgeWidth, nodeDist);
+
+      // Compute both shadow paths unconditionally and mix on the condition —
+      // replaces the if(borderZero == 1.0) early-return and the varying-driven
+      // if/else that caused warp divergence on Mali 400.
+      float shadowAlphaInner = shadowBox(boxUv - u_shadow.xy, v_halfDimensions + u_shadow.w - edgeWidth, u_radius + u_shadow.z);
+      float shadowAlphaOuter = shadowBox(boxUv + v_outerBorderUv - u_shadow.xy, v_outerSize + u_shadow.w - edgeWidth, v_outerBorderRadius + u_shadow.z);
+      // useOuter: 1.0 when outer border exceeds node half-dimensions AND border exists.
+      float useOuter = step(0.0, max(v_outerSize.x - v_halfDimensions.x, v_outerSize.y - v_halfDimensions.y)) * (1.0 - borderZero);
+      float shadowAlpha = mix(shadowAlphaInner, shadowAlphaOuter, useOuter);
+
+      float outerDist = roundedBox(boxUv + v_outerBorderUv, v_outerSize - edgeWidth, v_outerBorderRadius);
+      float innerDist = roundedBox(boxUv + v_innerBorderUv, v_innerSize - edgeWidth, v_innerBorderRadius);
+      float borderDist = max(-innerDist, outerDist);
+      // Multiply by (1.0 - borderZero) to zero out border contribution when no border
+      // is present — replaces the if(borderZero == 1.0) early return.
+      float borderAlpha = (1.0 - smoothstep(-0.5 * edgeWidth, 0.5 * edgeWidth, borderDist)) * u_borderColor.a * (1.0 - borderZero);
+
+      resultColor = mix(resultColor, u_shadowColor, shadowAlpha);
+      resultColor = mix(resultColor, color, nodeAlpha);
+      resultColor = mix(resultColor, vec4(u_borderColor.rgb, 1.0), borderAlpha);
+      gl_FragColor = resultColor * u_alpha;
+    }
+  `,
+};
+//# sourceMappingURL=RoundedWithBorderAndShadow.js.map

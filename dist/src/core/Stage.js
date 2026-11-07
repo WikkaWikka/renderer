@@ -1,0 +1,1133 @@
+/*
+ * If not stated otherwise in this file or this component's LICENSE file the
+ * following copyright and licenses apply:
+ *
+ * Copyright 2023 Comcast Cable Communications Management, LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import { assertTruthy, setPremultiplyMode } from '../utils.js';
+import { AnimationManager } from './animations/AnimationManager.js';
+import { UpdateType, CoreNode, CoreNodeRenderState, } from './CoreNode.js';
+import { CoreTextureManager } from './CoreTextureManager.js';
+import { CoreShaderManager } from './CoreShaderManager.js';
+import { EventEmitter } from '../common/EventEmitter.js';
+import { ContextSpy } from './lib/ContextSpy.js';
+import { TextureMemoryManager, } from './TextureMemoryManager.js';
+import { CoreTextNode, DEFAULT_CONTAIN, DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE, DEFAULT_FONT_STYLE, DEFAULT_LETTER_SPACING, DEFAULT_LINE_HEIGHT, DEFAULT_MAX_LINES, DEFAULT_OFFSET_Y, DEFAULT_OVERFLOW_SUFFIX, DEFAULT_TEXT, DEFAULT_TEXT_ALIGN, DEFAULT_VERTICAL_ALIGN, DEFAULT_WORD_BREAK, } from './CoreTextNode.js';
+import { santizeCustomDataMap } from '../main-api/utils.js';
+import { pointInBound } from './lib/utils.js';
+import { createBound, createPreloadBounds } from './lib/utils.js';
+import { ColorTexture } from './textures/ColorTexture.js';
+import { createFrameCounter, setFpsInterval, setFpsBoundaries, } from './lib/fps.js';
+export class Stage {
+    options;
+    /**
+     * Resolves after the first frame has been drawn.
+     *
+     * @remarks
+     * Lets apps distinguish "constructed" from "first frame capable" without
+     * guessing: `await renderer.ready` before building heavy scenes, or show
+     * loading UI until it resolves. Also resolved by `destroy()` so it never
+     * dangles if the loop never draws.
+     */
+    ready;
+    resolveReady = () => undefined;
+    firstFrameDrawn = false;
+    contextState = 'running';
+    contextSuspended = false;
+    contextGeneration = 0;
+    contextLostAt = 0;
+    pendingRestoreEvent = false;
+    restoreTimeoutHandle = null;
+    clearRestoreTimeout() {
+        if (this.restoreTimeoutHandle !== null)
+            clearTimeout(this.restoreTimeoutHandle);
+        this.restoreTimeoutHandle = null;
+    }
+    onContextLost() {
+        if (this.contextState === 'destroyed' || this.contextState === 'lost')
+            return;
+        // Invalidate stale loop callbacks first: GL-error detection paths call
+        // this directly and bypass the canvas `webglcontextlost` handler.
+        this.platform.suspendFrameLoop?.();
+        this.contextState = 'lost';
+        this.contextSuspended = true;
+        this.contextGeneration++;
+        this.contextLostAt = this.platform.getTimeStamp();
+        this.pendingRestoreEvent = false;
+        this.txManager.invalidateContext();
+        this.txMemManager.invalidateContext();
+        this.clearRestoreTimeout();
+        const generation = this.contextGeneration;
+        const timeout = this.options.contextRestoreTimeout ?? 10000;
+        if (timeout > 0) {
+            this.restoreTimeoutHandle = setTimeout(() => {
+                if (this.contextState !== 'lost' ||
+                    this.contextGeneration !== generation)
+                    return;
+                this.restoreTimeoutHandle = null;
+                this.eventBus.emit('contextRestoreFailed', {
+                    generation,
+                    error: new Error('WebGL context restoration timed out'),
+                });
+                // A late browser restoration remains valid.
+            }, timeout);
+        }
+        this.eventBus.emit('contextLost', { generation: this.contextGeneration });
+    }
+    onContextRestored() {
+        if (this.contextState !== 'lost' && this.contextState !== 'failed')
+            return false;
+        const generation = this.contextGeneration;
+        this.contextState = 'restoring';
+        this.clearRestoreTimeout();
+        try {
+            const renderer = this.renderer;
+            if (renderer.restoreContext === undefined) {
+                throw new Error('Renderer does not support context restoration');
+            }
+            renderer.restoreContext();
+            this.shManager.restoreContext();
+            if (this.contextGeneration !== generation ||
+                this.contextState !== 'restoring')
+                return false;
+            this.contextState = 'running';
+            this.txManager.restoreContext();
+            if (this.contextGeneration !== generation ||
+                this.contextState !== 'running')
+                return false;
+            this.lastFrameTime = 0;
+            this.currentFrameTime = 0;
+            this.root.setUpdateType(UpdateType.RenderBounds | UpdateType.Children);
+            for (const node of renderer.rttNodes)
+                node.hasRTTupdates = true;
+            this.requestRenderListUpdate();
+            this.requestRender();
+            this.contextSuspended = false;
+            this.pendingRestoreEvent = true;
+            return true;
+        }
+        catch (error) {
+            if (this.contextGeneration !== generation)
+                return false;
+            this.contextState = 'failed';
+            this.contextSuspended = true;
+            this.eventBus.emit('contextRestoreFailed', { generation, error });
+            return false;
+        }
+    }
+    // Report a failed recovery frame without hiding unrelated frame errors.
+    onRecoveryFrameFailed(error) {
+        if (this.pendingRestoreEvent === false || this.contextState !== 'running')
+            return false;
+        this.pendingRestoreEvent = false;
+        this.contextState = 'failed';
+        this.contextSuspended = true;
+        this.eventBus.emit('contextRestoreFailed', {
+            generation: this.contextGeneration,
+            error,
+        });
+        return true;
+    }
+    onRecoveryFrameCompleted() {
+        if (this.pendingRestoreEvent === false || this.contextState !== 'running')
+            return;
+        this.pendingRestoreEvent = false;
+        this.eventBus.emit('contextRestored', {
+            generation: this.contextGeneration,
+            duration: this.platform.getTimeStamp() - this.contextLostAt,
+        });
+    }
+    /// Module Instances
+    animationManager;
+    txManager;
+    txMemManager;
+    textRenderers = {};
+    fontHandlers = {};
+    shManager;
+    renderer;
+    root;
+    interactiveNodes = new Set();
+    boundsMargin;
+    defShaderNode = null;
+    strictBound;
+    preloadBound;
+    defaultTexture = null;
+    pixelRatio;
+    /**
+     * Global count of active animations (internal + external).
+     *
+     * @remarks
+     * Incremented by AnimationManager when an internal animation starts,
+     * decremented when it stops. External animation libraries (e.g. AnimeJS,
+     * GSAP) increment/decrement this counter via
+     * {@link RendererMain.registerAnimation} / {@link RendererMain.unregisterAnimation}.
+     *
+     * Used by the render loop to throttle texture uploads during animations:
+     * while > 0, at most `maxTextureUploadsDuringAnimation` textures are
+     * uploaded per frame to preserve the frame budget. When zero, the full
+     * time budget is used.
+     */
+    activeAnimationCount = 0;
+    // Pre-allocated frameTick payload -- reused every frame to avoid per-frame {} allocation
+    frameTickPayload = {
+        time: 0,
+        delta: 0,
+    };
+    bufferMemory = 2e6;
+    platform;
+    calculateTextureCoord;
+    quadsPayload = {
+        quads: 0,
+    };
+    /**
+     * Target frame time in milliseconds (calculated from targetFPS)
+     *
+     * @remarks
+     * This is pre-calculated to avoid recalculating on every frame.
+     * - 0 means no throttling (use display refresh rate)
+     * - >0 means throttle to this frame time (1000 / targetFPS)
+     */
+    targetFrameTime = 0;
+    /**
+     * Renderer Event Bus for the Stage to emit events onto
+     *
+     * @remarks
+     * In reality this is just the RendererMain instance, which is an EventEmitter.
+     * this allows us to directly emit events from the Stage to RendererMain
+     * without having to set up forwarding handlers.
+     */
+    eventBus;
+    /// State
+    startTime = 0;
+    deltaTime = 0;
+    lastFrameTime = 0;
+    currentFrameTime = 0;
+    elapsedTime = 0;
+    currentFrameCounter = null;
+    timedNodes = [];
+    clrColor = 0x00000000;
+    numQuadsRendered = 0;
+    renderRequested = false;
+    frameEventQueue = [];
+    // Flattened render list — caches the pre-order traversal of visible nodes
+    // and stencil clip operations. Rebuilt only when the scene structure changes
+    // (child add/remove, visibility toggle, z-sort). On clean frames the cached
+    // list is replayed linearly without recursion.
+    //
+    // Two parallel arrays encode a sequence of operations:
+    //   renderListOps[i] = 0  → renderQuads(renderListNodes[i])
+    //   renderListOps[i] = 1  → beginRoundedClip(renderListNodes[i])
+    //   renderListOps[i] = 2  → endRoundedClip(renderListNodes[i])
+    //
+    // renderListNodes is also read by the WebGL renderer (surgical uploads and
+    // slot invalidation), so it is public.
+    renderListNodes = [];
+    renderListOps = new Uint8Array(256);
+    renderListLen = 0;
+    renderListDirty = true;
+    // Font resolve optimisation flags
+    hasOnlyOneFontEngine;
+    hasOnlyCanvasFontEngine;
+    hasCanvasEngine;
+    initializedTextEngines = new Set();
+    singleFontEngine = null;
+    singleFontHandler = null;
+    // Debug data
+    contextSpy = null;
+    /**
+     * Stage constructor
+     */
+    constructor(options) {
+        this.options = options;
+        this.ready = new Promise((resolve) => {
+            this.resolveReady = resolve;
+        });
+        const { clearColor, appWidth, appHeight, boundsMargin, enableContextSpy, textureMemory, renderEngine, fontEngines, createImageBitmapSupport, platform, maxRetryCount, } = options;
+        assertTruthy(platform !== null, 'A CorePlatform is not provided in the options');
+        this.platform = platform;
+        this.startTime = platform.getTimeStamp();
+        this.eventBus = options.eventBus;
+        // Calculate target frame time from targetFPS option
+        this.targetFrameTime = options.targetFPS > 0 ? 1000 / options.targetFPS : 0;
+        this.txManager = new CoreTextureManager(this, {
+            createImageBitmapSupport,
+            maxRetryCount,
+        });
+        this.txMemManager = new TextureMemoryManager(this, textureMemory);
+        this.animationManager = new AnimationManager(this);
+        this.contextSpy = enableContextSpy ? new ContextSpy() : null;
+        // Set initial frame buckets and FPS update interval for FPS tracking
+        if (options.fpsBoundaries !== undefined) {
+            setFpsBoundaries(options.fpsBoundaries);
+        }
+        setFpsInterval(options.fpsUpdateInterval);
+        let bm = [0, 0, 0, 0];
+        if (boundsMargin) {
+            bm = Array.isArray(boundsMargin)
+                ? boundsMargin
+                : [boundsMargin, boundsMargin, boundsMargin, boundsMargin];
+        }
+        this.boundsMargin = bm;
+        // precalculate our viewport bounds
+        this.strictBound = createBound(0, 0, appWidth, appHeight);
+        this.preloadBound = createPreloadBounds(this.strictBound, bm);
+        this.clrColor = clearColor;
+        this.pixelRatio =
+            options.devicePhysicalPixelRatio * options.deviceLogicalPixelRatio;
+        this.renderer = new renderEngine(this);
+        // Must be set before createDefaultTexture(): the default texture upload
+        // runs synchronously during construction, so the texture manager needs
+        // the renderer to create its GPU-side context texture.
+        this.txManager.renderer = this.renderer;
+        this.shManager = new CoreShaderManager(this);
+        this.defShaderNode = this.renderer.getDefaultShaderNode();
+        this.calculateTextureCoord = this.renderer.getTextureCoords !== undefined;
+        const renderMode = this.renderer.mode || 'webgl';
+        // Canvas2D textures are plain JS heap objects managed by the browser GC.
+        // Threshold-based upload blocking makes no sense for JS heap — disable it
+        // by setting criticalThreshold to 0 while keeping the eviction machinery.
+        if (renderMode === 'canvas') {
+            this.txMemManager.updateSettings({
+                ...textureMemory,
+                criticalThreshold: 0,
+                doNotExceedCriticalThreshold: false,
+            });
+        }
+        this.createDefaultTexture();
+        setPremultiplyMode(renderMode);
+        // Register text renderers (engines initialize lazily on first use)
+        this.hasOnlyOneFontEngine = fontEngines.length === 1;
+        this.hasOnlyCanvasFontEngine =
+            fontEngines.length === 1 && fontEngines[0].type === 'canvas';
+        this.hasCanvasEngine = false;
+        this.singleFontEngine = this.hasOnlyOneFontEngine
+            ? fontEngines[0]
+            : null;
+        this.singleFontHandler = this.hasOnlyOneFontEngine
+            ? fontEngines[0]?.font
+            : null;
+        if (this.singleFontEngine === null) {
+            // Multiple font engines case
+            // Filter out incompatible engines first
+            const compatibleEngines = fontEngines.filter((fontEngine) => {
+                const type = fontEngine.type;
+                if (type === 'sdf' && renderMode !== 'webgl') {
+                    console.warn('SdfTextRenderer is only compatible with the WebGL renderer. Skipping...');
+                    return false;
+                }
+                if (type === 'canvas') {
+                    this.hasCanvasEngine = true;
+                }
+                return true;
+            });
+            // Sort engines: SDF first, Canvas last, others in between
+            const sortedEngines = compatibleEngines.sort((a, _b) => {
+                if (a.type === 'sdf')
+                    return -1;
+                return 1;
+            });
+            // Register engines in sorted order. Engines are initialized
+            // lazily on first use (see ensureTextEngineInitialized) so unused
+            // engines (e.g. Canvas fallback in an MSDF-only app) cost nothing.
+            sortedEngines.forEach((fontEngine) => {
+                const type = fontEngine.type;
+                // Add to map for type-based access
+                this.textRenderers[type] = fontEngine;
+                this.fontHandlers[type] = fontEngine.font;
+            });
+        }
+        else {
+            // Single font engine case - register it (initialization is lazy,
+            // see ensureTextEngineInitialized)
+            const fontEngine = this.singleFontEngine;
+            const type = fontEngine.type;
+            // Check compatibility
+            if (type === 'sdf' && renderMode !== 'webgl') {
+                console.warn('SdfTextRenderer is only compatible with the WebGL renderer. Skipping...');
+            }
+            else {
+                if (type === 'canvas') {
+                    this.hasCanvasEngine = true;
+                }
+                // Add to map for type-based access
+                this.textRenderers[type] = fontEngine;
+                this.fontHandlers[type] = fontEngine.font;
+            }
+        }
+        if (Object.keys(this.textRenderers).length === 0) {
+            console.warn('No text renderers available. Your text will not render.');
+        }
+        // create root node
+        const rootNode = new CoreNode(this, {
+            x: 0,
+            y: 0,
+            w: appWidth,
+            h: appHeight,
+            alpha: 1,
+            autosize: false,
+            boundsMargin: null,
+            clipping: false,
+            clipRadius: 0,
+            color: 0x00000000,
+            colorTop: 0x00000000,
+            colorBottom: 0x00000000,
+            colorLeft: 0x00000000,
+            colorRight: 0x00000000,
+            colorTl: 0x00000000,
+            colorTr: 0x00000000,
+            colorBl: 0x00000000,
+            colorBr: 0x00000000,
+            zIndex: 0,
+            scaleX: 1,
+            scaleY: 1,
+            mountX: 0,
+            mountY: 0,
+            mount: 0,
+            pivot: 0.5,
+            pivotX: 0.5,
+            pivotY: 0.5,
+            rotation: 0,
+            parent: null,
+            texture: null,
+            textureOptions: {},
+            shader: this.defShaderNode,
+            rtt: false,
+            src: null,
+            scale: 1,
+        });
+        this.root = rootNode;
+        // execute platform start loop
+        if (options.autoStart === true) {
+            this.platform.startLoop(this);
+        }
+    }
+    setClearColor(color) {
+        this.clearColor = color;
+        this.renderer.updateClearColor(color);
+        this.renderRequested = true;
+    }
+    /**
+     * Update the target frame time based on the current targetFPS setting
+     *
+     * @remarks
+     * This should be called whenever the targetFPS option is changed
+     * to ensure targetFrameTime stays in sync.
+     * targetFPS of 0 means no throttling (targetFrameTime = 0)
+     * targetFPS > 0 means throttle to 1000/targetFPS milliseconds
+     */
+    updateTargetFrameTime() {
+        this.targetFrameTime =
+            this.options.targetFPS > 0 ? 1000 / this.options.targetFPS : 0;
+    }
+    updateFrameTime() {
+        const newFrameTime = this.platform.getTimeStamp();
+        this.lastFrameTime = this.currentFrameTime;
+        this.currentFrameTime = newFrameTime;
+        this.elapsedTime = newFrameTime - this.startTime;
+        this.deltaTime =
+            this.lastFrameTime === 0 ? 100 / 6 : newFrameTime - this.lastFrameTime;
+        this.txManager.frameTime = newFrameTime;
+        this.txMemManager.frameTime = newFrameTime;
+        // This event is emitted at the beginning of the frame (before any updates
+        // or rendering), so no need to to use `stage.queueFrameEvent` here.
+        // App-facing: isolated per-listener so a bad client callback can't kill rAF.
+        this.frameTickPayload.time = this.currentFrameTime;
+        this.frameTickPayload.delta = this.deltaTime;
+        this.eventBus.emitSafe('frameTick', this.frameTickPayload, this.platform.settings.handleLoopError);
+    }
+    /**
+     * Create default PixelTexture
+     */
+    createDefaultTexture() {
+        this.defaultTexture = this.txManager.createTexture('ColorTexture', {
+            color: 0xffffffff,
+        });
+        assertTruthy(this.defaultTexture instanceof ColorTexture);
+        this.txManager.loadTexture(this.defaultTexture, true);
+        // Mark the default texture as ALWAYS renderable
+        // This prevents it from ever being cleaned up.
+        // Fixes https://github.com/lightning-js/renderer/issues/262
+        this.defaultTexture.setRenderableOwner('stage', true);
+        // When the default texture is loaded, request a render in case the
+        // RAF is paused. Fixes: https://github.com/lightning-js/renderer/issues/123
+        this.defaultTexture.once('loaded', () => {
+            this.requestRender();
+        });
+    }
+    /**
+     * Update animations
+     */
+    updateAnimations() {
+        const { animationManager } = this;
+        if (!this.root) {
+            return;
+        }
+        // step animation
+        animationManager.update(this.deltaTime);
+    }
+    /**
+     * Check if the scene has updates
+     */
+    hasSceneUpdates() {
+        return (!!this.root.updateType ||
+            this.renderRequested ||
+            this.txManager.hasUpdates());
+    }
+    /**
+     * Start a new frame draw
+     */
+    drawFrame() {
+        if (this.contextSuspended === true)
+            return;
+        const { renderer, renderRequested, root } = this;
+        // Update tree if needed
+        if (root.updateType !== 0) {
+            root.update(this.deltaTime, root.clippingRect);
+        }
+        // Process some textures asynchronously but don't block the frame.
+        // During active animations, limit texture uploads per frame (configurable
+        // via `maxTextureUploadsDuringAnimation`) to preserve the frame budget.
+        // When idle, use the full time budget.
+        if (this.txManager.hasUpdates() === true) {
+            const cap = this.options.maxTextureUploadsDuringAnimation;
+            const maxCount = this.activeAnimationCount > 0 && cap > 0 ? cap : 0x7fffffff;
+            this.txManager.processSome(this.options.textureProcessingTimeLimit, maxCount);
+            if (root.updateType !== 0) {
+                root.update(this.deltaTime, root.clippingRect);
+            }
+        }
+        // Reset render operations and clear the canvas
+        renderer.reset();
+        // If we have RTT nodes draw them first
+        // So we can use them as textures in the main scene
+        if (renderer.rttNodes.length > 0) {
+            renderer.renderRTTNodes();
+        }
+        // Fill quads buffer — rebuild the flat render list when dirty,
+        // otherwise replay the cached list without recursion.
+        if (this.renderListDirty === true) {
+            this.renderListLen = 0;
+            this.renderListNodes.length = 0;
+            this.buildRenderList(this.root);
+            this.renderListDirty = false;
+        }
+        else {
+            const nodes = this.renderListNodes;
+            const ops = this.renderListOps;
+            const len = this.renderListLen;
+            for (let i = 0; i < len; i++) {
+                const op = ops[i];
+                const node = nodes[i];
+                if (op === 0) {
+                    node.renderQuads(renderer);
+                }
+                else if (op === 1) {
+                    renderer.beginRoundedClip(node);
+                }
+                else {
+                    renderer.endRoundedClip(node);
+                }
+            }
+        }
+        // Perform render pass
+        renderer.render();
+        this.calculateFps();
+        this.calculateQuads();
+        // Reset renderRequested flag if it was set
+        if (renderRequested === true) {
+            this.renderRequested = false;
+        }
+        if (this.timedNodes.length > 0) {
+            for (let key in this.timedNodes) {
+                if (this.timedNodes[key].isRenderable === true) {
+                    this.requestRender();
+                    break;
+                }
+            }
+        }
+        // Check if we need to cleanup textures
+        if (this.txMemManager.criticalCleanupRequested === true) {
+            this.txMemManager.cleanup();
+        }
+        if (this.firstFrameDrawn === false) {
+            this.firstFrameDrawn = true;
+            this.resolveReady();
+        }
+    }
+    /**
+     * Queue an event to be emitted after the current/next frame is rendered
+     *
+     * @remarks
+     * When we are operating in the context of the render loop, we may want to
+     * emit events that are related to the current frame. However, we generally do
+     * NOT want to emit events directly in the middle of the render loop, since
+     * this could enable event handlers to modify the scene graph and cause
+     * unexpected behavior. Instead, we queue up events to be emitted and then
+     * flush the queue after the frame has been rendered.
+     *
+     * @param name
+     * @param data
+     */
+    queueFrameEvent(name, data) {
+        this.frameEventQueue.push([name, data]);
+    }
+    /**
+     * Emit all queued frame events
+     *
+     * @remarks
+     * This method should be called after the frame has been rendered to emit
+     * all events that were queued during the frame.
+     *
+     * App-facing (`fpsUpdate`, `quadsUpdate`, `criticalCleanup*`): each event
+     * is fanned out via `emitSafe`, so one bad listener neither blocks the
+     * remaining listeners nor the remaining queued events, and never kills rAF.
+     *
+     * See {@link queueFrameEvent} for more information.
+     */
+    flushFrameEvents() {
+        // No `try` here by design: `emitSafe` never throws, so iteration always
+        // reaches every queued event and the queue is always drained.
+        const onError = this.platform.settings.handleLoopError;
+        for (const [name, data] of this.frameEventQueue) {
+            this.eventBus.emitSafe(name, data, onError);
+        }
+        this.frameEventQueue = [];
+    }
+    calculateFps() {
+        // If there's an FPS update interval, emit the FPS update event
+        // when the specified interval has elapsed.
+        const { fpsUpdateInterval } = this.options;
+        if (fpsUpdateInterval > 0) {
+            let frameCounter = this.currentFrameCounter;
+            const elapsed = this.elapsedTime;
+            if (frameCounter === null) {
+                frameCounter = this.currentFrameCounter = createFrameCounter(elapsed);
+            }
+            frameCounter.increment(this.deltaTime);
+            if (frameCounter.end <= elapsed) {
+                this.queueFrameEvent('fpsUpdate', {
+                    fps: Math.round((frameCounter.total / (elapsed - frameCounter.start)) * 1000),
+                    contextSpyData: this.contextSpy?.getData() ?? null,
+                    frameCount: {
+                        //only make a copy of the boundaries array since it's read-only and we want to prevent mutation from outside
+                        boundaries: [].concat(frameCounter.boundaries),
+                        //count and total are not mutated inside the renderer anymore so no copy is necessary
+                        count: frameCounter.count,
+                        total: frameCounter.total,
+                    },
+                });
+                this.contextSpy?.reset();
+                this.currentFrameCounter = null;
+            }
+        }
+    }
+    updateFpsUpdateInterval(newInterval) {
+        this.options.fpsUpdateInterval = newInterval;
+        setFpsInterval(newInterval);
+        // Reset current frame counter to start new interval
+        this.currentFrameCounter = null;
+    }
+    updateFpsBoundaries(newBoundaries) {
+        this.options.fpsBoundaries = newBoundaries;
+        setFpsBoundaries(newBoundaries);
+        // Reset current frame counter to start new interval with new boundaries
+        this.currentFrameCounter = null;
+    }
+    calculateQuads() {
+        const quads = this.renderer.getQuadCount();
+        if (quads && quads !== this.numQuadsRendered) {
+            this.numQuadsRendered = quads;
+            this.quadsPayload.quads = quads;
+            this.queueFrameEvent('quadsUpdate', this.quadsPayload);
+        }
+    }
+    /**
+     * Mark the render list as dirty, triggering a rebuild on the next frame.
+     *
+     * @remarks
+     * Called by CoreNode when the scene structure changes (child add/remove,
+     * visibility toggle, z-index re-sort). Deduplicated: if the list is
+     * already dirty, this is a no-op.
+     */
+    requestRenderListUpdate() {
+        if (this.renderListDirty === true) {
+            return;
+        }
+        this.renderListDirty = true;
+        this.requestRender();
+        // A render list rebuild invalidates all permanent quad buffer slot
+        // assignments, so the renderer must reset them and force a full upload.
+        // Only applies when surgical dirty-quad repaints are enabled (PR #861);
+        // otherwise the renderer re-uploads the full buffer every frame anyway.
+        if (this.options.enableDirtyRepaints === true &&
+            this.renderer.invalidateQuadBuffer !== undefined) {
+            this.renderer.invalidateQuadBuffer();
+        }
+    }
+    /**
+     * Append a render operation to the cached render list.
+     *
+     * @param node - The node associated with this operation
+     * @param op - 0 = renderQuads, 1 = beginRoundedClip, 2 = endRoundedClip
+     */
+    pushRenderOp(node, op) {
+        const idx = this.renderListLen;
+        // Grow the ops Uint8Array if needed
+        if (idx >= this.renderListOps.length) {
+            const newOps = new Uint8Array(this.renderListOps.length * 2);
+            newOps.set(this.renderListOps);
+            this.renderListOps = newOps;
+        }
+        this.renderListOps[idx] = op;
+        this.renderListNodes[idx] = node;
+        this.renderListLen = idx + 1;
+    }
+    /**
+     * Build a flat render list by walking the scene tree in pre-order.
+     *
+     * @remarks
+     * Functionally identical to the previous recursive `addQuads` method but
+     * additionally caches the traversal result (nodes + stencil clip ops) so
+     * that clean frames can replay the list linearly without recursion.
+     *
+     * On rebuild frames, `renderQuads` is called inline (same as before) so
+     * the renderer's `renderOps` array is populated during the walk.
+     *
+     * @param node - Current node being visited
+     * @param cache - Whether to record the traversal into the cached render
+     * list. When false, quads/stencil ops are fed to the renderer immediately
+     * without caching (used by the RTT path).
+     */
+    buildRenderList(node, cache = true) {
+        const renderer = this.renderer;
+        const hasRoundedClip = node.props.clipping === true && node.props.clipRadius > 0;
+        if (hasRoundedClip === true) {
+            renderer.beginRoundedClip(node);
+            if (cache === true) {
+                this.pushRenderOp(node, 1);
+            }
+        }
+        if (node.isRenderable === true) {
+            // All renderable nodes — images, rects and text alike — write inline in
+            // traversal order so the renderer's op sequence preserves the scene's
+            // z-order. Consecutive SDF text nodes sharing a layout, atlas and clip
+            // rect still merge into a single draw call via the renderer's batch
+            // tracking; text separated by another node stays in correct z-order.
+            node.renderQuads(renderer);
+            if (cache === true) {
+                this.pushRenderOp(node, 0);
+            }
+        }
+        const children = node.children;
+        for (let i = 0, len = children.length; i < len; i++) {
+            const child = children[i];
+            if (child === undefined) {
+                continue;
+            }
+            if (child.worldAlpha === 0 ||
+                child.renderState === CoreNodeRenderState.OutOfBounds) {
+                continue;
+            }
+            this.buildRenderList(child, cache);
+        }
+        if (hasRoundedClip === true) {
+            renderer.endRoundedClip(node);
+            if (cache === true) {
+                this.pushRenderOp(node, 2);
+            }
+        }
+    }
+    /**
+     * Walk a node's subtree and feed quads + stencil clip ops to the active
+     * renderer without touching the cached render list.
+     *
+     * @remarks
+     * Used by the render-to-texture path, which draws each RTT subtree to its
+     * own framebuffer immediately and then flushes the renderer's operation
+     * queue.
+     *
+     * @param node - Root of the subtree to render
+     */
+    addSubtreeQuads(node) {
+        this.buildRenderList(node, false);
+    }
+    /**
+     * Request a render pass without forcing an update
+     */
+    requestRender() {
+        this.renderRequested = true;
+    }
+    /**
+     * Initialize a text engine on first use.
+     *
+     * @remarks
+     * Engines are registered (not initialized) in the constructor so unused
+     * engines — e.g. the Canvas fallback in an MSDF-only app — never pay for
+     * canvas allocation and context setup. Initialization is idempotent per
+     * engine type.
+     */
+    ensureTextEngineInitialized(type) {
+        if (this.initializedTextEngines.has(type)) {
+            return;
+        }
+        const engine = this.textRenderers[type];
+        if (engine === undefined) {
+            return;
+        }
+        engine.init(this);
+        this.initializedTextEngines.add(type);
+    }
+    /**
+     * Given a font name, and possible renderer override, return the best compatible text renderer.
+     *
+     * @remarks
+     * Will try to return a canvas renderer if no other suitable renderer can be resolved.
+     *
+     * As a side effect the returned engine is initialized (see
+     * {@link ensureTextEngineInitialized}) and a load of the requested font
+     * family is kicked off when the handler supports it, so the first text
+     * node warms everything its first frame needs.
+     *
+     * @param fontFamily
+     * @param textRendererOverride
+     * @returns
+     */
+    resolveTextRenderer(trProps, textRendererOverride = null) {
+        // If we have an overide, return it
+        if (textRendererOverride !== null) {
+            const overrideKey = String(textRendererOverride);
+            if (this.textRenderers[overrideKey] === undefined) {
+                console.warn(`Text renderer override '${overrideKey}' not found.`);
+                return null;
+            }
+            this.ensureTextEngineInitialized(overrideKey);
+            this.fontHandlers[overrideKey]?.requestLoad?.(this, trProps.fontFamily);
+            return this.textRenderers[overrideKey];
+        }
+        // If we have only one font engine early return it
+        if (this.singleFontEngine !== null) {
+            // If we have only one font engine and its the canvas engine, we can just return it
+            if (this.hasOnlyCanvasFontEngine === true) {
+                this.ensureTextEngineInitialized('canvas');
+                this.fontHandlers['canvas']?.requestLoad?.(this, trProps.fontFamily);
+                return this.singleFontEngine;
+            }
+            // If we have only one font engine and it can render the font, return it
+            if (this.singleFontHandler?.canRenderFont(trProps) === true) {
+                const type = this.singleFontEngine.type;
+                this.ensureTextEngineInitialized(type);
+                this.singleFontHandler?.requestLoad?.(this, trProps.fontFamily);
+                return this.singleFontEngine;
+            }
+            // If we have only one font engine and it cannot render the font, return null
+            console.warn(`Text renderer cannot render font`, trProps);
+            return null;
+        }
+        // Multi font handling  - If we have multiple font engines, we need to resolve the best one
+        // First check SDF
+        if (this.fontHandlers['sdf']?.canRenderFont(trProps) === true) {
+            this.ensureTextEngineInitialized('sdf');
+            this.fontHandlers['sdf']?.requestLoad?.(this, trProps.fontFamily);
+            return this.textRenderers.sdf || null;
+        }
+        // If we have a canvas engine, we can return it (it can render all fonts)
+        if (this.hasCanvasEngine === true) {
+            this.ensureTextEngineInitialized('canvas');
+            this.fontHandlers['canvas']?.requestLoad?.(this, trProps.fontFamily);
+            return this.textRenderers.canvas || null;
+        }
+        // If we have no font engines, return null
+        console.warn('No text renderers available. Your text will not render.');
+        return null;
+    }
+    createNode(props) {
+        const resolvedProps = this.resolveNodeDefaults(props);
+        return new CoreNode(this, resolvedProps);
+    }
+    createTextNode(props) {
+        const fontSize = props.fontSize || DEFAULT_FONT_SIZE;
+        const resolvedProps = Object.assign(this.resolveNodeDefaults(props), {
+            text: props.text || DEFAULT_TEXT,
+            textRendererOverride: props.textRendererOverride || null,
+            fontSize,
+            fontFamily: props.fontFamily || DEFAULT_FONT_FAMILY,
+            fontStyle: props.fontStyle || DEFAULT_FONT_STYLE,
+            textAlign: props.textAlign || DEFAULT_TEXT_ALIGN,
+            offsetY: props.offsetY || DEFAULT_OFFSET_Y,
+            letterSpacing: props.letterSpacing || DEFAULT_LETTER_SPACING,
+            lineHeight: props.lineHeight || DEFAULT_LINE_HEIGHT,
+            maxLines: props.maxLines || DEFAULT_MAX_LINES,
+            verticalAlign: props.verticalAlign || DEFAULT_VERTICAL_ALIGN,
+            overflowSuffix: props.overflowSuffix || DEFAULT_OVERFLOW_SUFFIX,
+            wordBreak: props.wordBreak || DEFAULT_WORD_BREAK,
+            contain: props.contain || DEFAULT_CONTAIN,
+            maxWidth: props.maxWidth || 0,
+            maxHeight: props.maxHeight || 0,
+            forceLoad: props.forceLoad || false,
+            richText: props.richText ?? false,
+        });
+        const resolvedTextRenderer = this.resolveTextRenderer(resolvedProps, resolvedProps.textRendererOverride);
+        if (!resolvedTextRenderer) {
+            throw new Error(`No compatible text renderer found for ${resolvedProps.fontFamily}`);
+        }
+        return new CoreTextNode(this, resolvedProps, resolvedTextRenderer);
+    }
+    setBoundsMargin(value) {
+        this.boundsMargin = Array.isArray(value)
+            ? value
+            : [value, value, value, value];
+        this.root.setUpdateType(UpdateType.RenderBounds);
+    }
+    /**
+     * Update the viewport bounds
+     */
+    updateViewportBounds() {
+        const { appWidth, appHeight } = this.options;
+        this.strictBound = createBound(0, 0, appWidth, appHeight);
+        this.preloadBound = createPreloadBounds(this.strictBound, this.boundsMargin);
+        this.root.setUpdateType(UpdateType.RenderBounds | UpdateType.Children);
+        this.root.childUpdateType |= UpdateType.RenderBounds;
+    }
+    /** Find all nodes at a given point
+     * @param data
+     */
+    findNodesAtPoint(data) {
+        const x = data.x / this.options.deviceLogicalPixelRatio;
+        const y = data.y / this.options.deviceLogicalPixelRatio;
+        const nodes = [];
+        for (const node of this.interactiveNodes) {
+            if (node.isRenderable === false) {
+                continue;
+            }
+            if (pointInBound(x, y, node.renderBound) === true) {
+                nodes.push(node);
+            }
+        }
+        return nodes;
+    }
+    /**
+     * Find the top node at a given point
+     * @param data
+     * @returns
+     */
+    getNodeFromPosition(data) {
+        const nodes = this.findNodesAtPoint(data);
+        if (nodes.length === 0) {
+            return null;
+        }
+        //get last node in array (as top node)
+        let topNode = nodes[nodes.length - 1];
+        for (let i = 0; i < nodes.length; i++) {
+            if (nodes[i].zIndex > topNode.zIndex) {
+                topNode = nodes[i];
+            }
+        }
+        return topNode || null;
+    }
+    /**
+     * add node to timeNodes arrays
+     * @param node
+     * @returns
+     */
+    trackTimedNode(node) {
+        if (this.timedNodes[node.id] !== undefined) {
+            return;
+        }
+        this.timedNodes[node.id] = node;
+    }
+    /**
+     * remove node from timeNodes arrays
+     * @param node
+     * @returns
+     */
+    untrackTimedNode(node) {
+        if (this.timedNodes[node.id] === undefined) {
+            return;
+        }
+        delete this.timedNodes[node.id];
+    }
+    /**
+     * Resolves the default property values for a Node
+     *
+     * @remarks
+     * This method is used internally by the RendererMain to resolve the default
+     * property values for a Node. It is exposed publicly so that it can be used
+     * by Core Driver implementations.
+     *
+     * @param props
+     * @returns
+     */
+    resolveNodeDefaults(props) {
+        const { colorTop: top, colorBottom: bottom, colorLeft: left, colorRight: right, } = props;
+        const color = props.color ?? 0xffffffff;
+        const colorTop = top ?? color;
+        const colorBottom = bottom ?? color;
+        const colorLeft = left ?? color;
+        const colorRight = right ?? color;
+        const colorTl = props.colorTl ?? top ?? left ?? color;
+        const colorTr = props.colorTr ?? top ?? right ?? color;
+        const colorBl = props.colorBl ?? bottom ?? left ?? color;
+        const colorBr = props.colorBr ?? bottom ?? right ?? color;
+        const scale = props.scale ?? null;
+        const mount = props.mount ?? 0;
+        const pivot = props.pivot ?? 0.5;
+        const data = this.options.inspector
+            ? santizeCustomDataMap(props.data ?? {})
+            : {};
+        return {
+            x: props.x ?? 0,
+            y: props.y ?? 0,
+            w: props.w ?? 0,
+            h: props.h ?? 0,
+            alpha: props.alpha ?? 1,
+            autosize: props.autosize ?? false,
+            boundsMargin: props.boundsMargin ?? null,
+            clipping: props.clipping ?? false,
+            clipRadius: props.clipRadius ?? 0,
+            color,
+            colorTop,
+            colorBottom,
+            colorLeft,
+            colorRight,
+            colorTl,
+            colorTr,
+            colorBl,
+            colorBr,
+            zIndex: props.zIndex ?? 0,
+            parent: props.parent ?? null,
+            texture: props.texture ?? null,
+            textureOptions: props.textureOptions ?? {},
+            shader: props.shader ?? this.defShaderNode,
+            src: props.src ?? null,
+            srcHeight: props.srcHeight,
+            srcWidth: props.srcWidth,
+            srcX: props.srcX,
+            srcY: props.srcY,
+            scale,
+            scaleX: props.scaleX ?? scale ?? 1,
+            scaleY: props.scaleY ?? scale ?? 1,
+            mount,
+            mountX: props.mountX ?? mount,
+            mountY: props.mountY ?? mount,
+            pivot,
+            pivotX: props.pivotX ?? pivot,
+            pivotY: props.pivotY ?? pivot,
+            rotation: props.rotation ?? 0,
+            rtt: props.rtt ?? false,
+            data,
+            imageType: props.imageType,
+            interactive: props.interactive ?? false,
+        };
+    }
+    /**
+     * Cleanup Orphaned Textures
+     *
+     * @remarks
+     * This method is used to cleanup orphaned textures that are no longer in use.
+     */
+    cleanup(full = false) {
+        this.txMemManager.cleanup(full);
+    }
+    /**
+     * Destroy the stage and release all resources.
+     *
+     * @remarks
+     * This method stops the render loop, destroys all nodes, releases all
+     * textures and GPU resources, and terminates any background workers.
+     */
+    destroy() {
+        this.clearRestoreTimeout();
+        this.contextState = 'destroyed';
+        this.contextSuspended = true;
+        this.contextGeneration++;
+        this.platform.suspendFrameLoop?.();
+        // Resolve readiness so `ready` never dangles if no frame was drawn.
+        this.resolveReady();
+        // Stop the render loop and terminate workers
+        this.platform.stopLoop();
+        // Recursively destroy all nodes (includes CoreTextNode font/text cleanup)
+        this.root.destroy();
+        // Free all GPU-side textures and clear internal tracking arrays/caches
+        this.txMemManager.destroy();
+        // Clear the texture upload queue and key caches
+        this.txManager.destroy();
+        // Release the GPU context (WebGL) or canvas resources
+        this.renderer.destroy();
+        // Clear text renderer caches
+        for (const key in this.textRenderers) {
+            this.textRenderers[key].clearCache();
+        }
+    }
+    set clearColor(value) {
+        this.renderer.updateClearColor(value);
+        this.renderRequested = true;
+        this.clrColor = value;
+    }
+    get clearColor() {
+        return this.clrColor;
+    }
+    /**
+     * Register a font using a specific text renderer type
+     *
+     * @remarks
+     * This method allows consumers to explicitly register fonts for a specific
+     * text renderer type (e.g., 'canvas', 'sdf'). Consumers must specify
+     * the renderer type to ensure fonts are loaded with the correct pipeline.
+     *
+     * Registration only stores where to find the font — no fetch, decode, or
+     * GPU upload happens here. Loading starts automatically on first use of
+     * the font family (or via {@link preloadFont} for eager loading), so
+     * registered fonts that are never rendered cost nothing.
+     *
+     * For Canvas fonts, provide fontUrl (e.g., .ttf, .woff, .woff2)
+     * For SDF fonts, provide atlasUrl (image) and atlasDataUrl (JSON glyph data)
+     *
+     * @param rendererType - The type of text renderer ('canvas', 'sdf', etc.)
+     * @param options - Font loading options specific to the renderer type
+     * @returns Promise that resolves when the font is registered
+     */
+    async loadFont(rendererType, options) {
+        const rendererTypeKey = String(rendererType);
+        const fontHandler = this.fontHandlers[rendererTypeKey];
+        if (!fontHandler) {
+            throw new Error(`Font handler for renderer type '${rendererTypeKey}' not found. Available types: ${Object.keys(this.fontHandlers).join(', ')}`);
+        }
+        return fontHandler.loadFont(this, options);
+    }
+    /**
+     * Eagerly load a font, resolving only after it is renderable.
+     *
+     * @remarks
+     * Unlike {@link loadFont} (register-only), this fetches, decodes, and
+     * uploads the font immediately. Use when first-paint readiness of a font
+     * must be guaranteed (e.g. awaited before drawing).
+     *
+     * @param rendererType - The type of text renderer ('canvas', 'sdf', etc.)
+     * @param options - Font loading options specific to the renderer type
+     * @returns Promise that resolves when the font is loaded
+     */
+    async preloadFont(rendererType, options) {
+        const rendererTypeKey = String(rendererType);
+        const fontHandler = this.fontHandlers[rendererTypeKey];
+        if (!fontHandler) {
+            throw new Error(`Font handler for renderer type '${rendererTypeKey}' not found. Available types: ${Object.keys(this.fontHandlers).join(', ')}`);
+        }
+        if (fontHandler.preloadFont !== undefined) {
+            return fontHandler.preloadFont(this, options);
+        }
+        return fontHandler.loadFont(this, options);
+    }
+}
+//# sourceMappingURL=Stage.js.map

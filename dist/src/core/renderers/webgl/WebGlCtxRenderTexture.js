@@ -1,0 +1,63 @@
+/*
+ * If not stated otherwise in this file or this component's LICENSE file the
+ * following copyright and licenses apply:
+ *
+ * Copyright 2024 Comcast Cable Communications Management, LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import { WebGlCtxTexture } from './WebGlCtxTexture.js';
+export class WebGlCtxRenderTexture extends WebGlCtxTexture {
+    framebuffer = null;
+    txCoords = {
+        x1: 0,
+        y1: 1,
+        x2: 1,
+        y2: 0,
+    };
+    constructor(glw, memManager, textureSource) {
+        super(glw, memManager, textureSource);
+    }
+    onLoadRequest() {
+        const { glw } = this;
+        const nativeTexture = (this._nativeCtxTexture =
+            this.createNativeCtxTexture());
+        if (!nativeTexture) {
+            throw new Error('Failed to create native texture for RenderTexture');
+        }
+        const { w, h } = this.textureSource;
+        // Create Framebuffer object
+        this.framebuffer = glw.createFramebuffer();
+        // Set the dimensions of the render texture
+        glw.texImage2D(0, glw.RGBA, w, h, 0, glw.RGBA, glw.UNSIGNED_BYTE, null);
+        // Update the texture memory manager
+        this.setTextureMemUse(w * h * 4);
+        // Bind the framebuffer
+        glw.bindFramebuffer(this.framebuffer);
+        // Attach the texture to the framebuffer
+        glw.framebufferTexture2D(glw.COLOR_ATTACHMENT0, nativeTexture, 0);
+        // Unbind the framebuffer
+        glw.bindFramebuffer(null);
+        return {
+            w,
+            h,
+        };
+    }
+    free() {
+        super.free();
+        // Delete the framebuffer
+        this.glw.deleteFramebuffer(this.framebuffer);
+        this.framebuffer = null;
+    }
+}
+//# sourceMappingURL=WebGlCtxRenderTexture.js.map

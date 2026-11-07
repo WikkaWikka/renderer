@@ -1,0 +1,1 @@
+export declare const createImageBitmap: (blob: ImageBitmapSource, sxOrOptions?: number | ImageBitmapOptions, sy?: number, sw?: number, sh?: number, options?: ImageBitmapOptions) => Promise<ImageBitmap>;

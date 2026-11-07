@@ -1,0 +1,149 @@
+import { type Stage } from '../Stage.js';
+import type { ImageResponse } from '../textures/ImageTexture.js';
+import type { GlContextWrapper } from './GlContextWrapper.js';
+/**
+ * Settings for the Platform
+ */
+export interface PlatformSettings {
+    /**
+     * Number of image workers to spawn for parallel image processing
+     * @default 2
+     */
+    numImageWorkers?: number;
+    /**
+     * Whether to force the use of WebGL2 (if supported by the platform) or WebGL1. By default, the platform will use WebGL2 if it is available, and fall back to WebGL1 if it is not.
+     * @default false
+     */
+    forceWebGL2?: boolean;
+    /**
+     * Optional provided canvas element to use for rendering. If not provided, the platform will create its own canvas element.
+     */
+    canvas?: HTMLCanvasElement | null;
+    /**
+     * Request Animation Frame Error Callback
+     *
+     * @remarks
+     * Invoked when application code called from the render loop throws
+     * (animation callbacks, `frameTick` / `idle` / `active` / `fpsUpdate` /
+     * `quadsUpdate` / `criticalCleanup*` listeners, custom easing functions).
+     * The loop survives the error and keeps scheduling frames; this callback
+     * is the app's hook to log/report it. Never rethrown.
+     *
+     * Called in all environments. Without it, errors fall back to
+     * `console.error` in development builds and are swallowed silently in
+     * production — so wire this up for prod telemetry.
+     *
+     * @param error The error that was thrown
+     */
+    handleLoopError?: (error: unknown) => void;
+}
+export declare abstract class Platform {
+    readonly settings: PlatformSettings & Required<Pick<PlatformSettings, 'numImageWorkers' | 'forceWebGL2'>>;
+    glw: GlContextWrapper | null;
+    canvas: HTMLCanvasElement | null;
+    constructor(settings?: PlatformSettings);
+    /**
+     * Creates a new canvas element.
+     * @returns The created HTMLCanvasElement.
+     */
+    abstract createCanvas(): HTMLCanvasElement;
+    abstract createOffscreenCanvas(): OffscreenCanvas | null;
+    /**
+     * Create new rendering context (only for WebGL, Canvas does not require a context)
+     */
+    abstract createContext(): GlContextWrapper;
+    /**
+     * Get a DOM element by ID
+     * @returns The DOM element (or null)
+     */
+    abstract getElementById(id: string): HTMLElement | null;
+    /**
+     * Starts the main rendering loop, calling the provided update function every frame.
+     * @param Stage - The stage for rendering
+     */
+    abstract startLoop(stage: Stage): void;
+    /**
+     * Stops the main rendering loop and releases platform resources.
+     */
+    abstract stopLoop(): void;
+    /**
+     * Suspend any scheduled frames without detaching context listeners.
+     *
+     * Called by Stage when GPU work becomes illegal (context loss / destroy)
+     * so that GL-error detection paths (which bypass canvas events) also
+     * invalidate stale rAF/timeout callbacks.
+     */
+    suspendFrameLoop?(): void;
+    /**
+     * Fetches a resource from the network.
+     * @param url - The URL of the resource to fetch.
+     * @returns A promise that resolves with the response.
+     */
+    abstract fetch(url: string): Promise<unknown>;
+    /**
+     * Loads an image from a UR and returns it as an ImageBitmap or HTMLImageElement.
+     * @param src - The source URL or Blob of the image to load.
+     * @param premultiplyAlpha - Whether to premultiply alpha (if supported by the platform).
+     * @param sx - The x coordinate of the top left corner of the sub-rectangle of the source image to draw into the destination context.
+     * @param sy - The y coordinate of the top left corner of the sub-rectangle of the source image to draw into the destination context.
+     * @param sw - The width of the sub-rectangle of the source image to draw into the destination context.
+     * @param sh - The height of the sub-rectangle of the source image to draw into the destination context.
+     * @returns A promise that resolves with an object containing the loaded image and whether alpha was premultiplied.
+     */
+    abstract loadImage(src: string, premultiplyAlpha: boolean, sx?: number | null, sy?: number | null, sw?: number | null, sh?: number | null): Promise<ImageResponse>;
+    /**
+     * Create an image out of a Blob
+     *
+     * @param blob - The Blob to create an image from
+     * @param premultiplyAlpha - Whether to premultiply alpha (if supported by the platform).
+     * @param sx - The x coordinate of the top left corner of the sub-rectangle of the source image to draw into the destination context.
+     * @param sy - The y coordinate of the top left corner of the sub-rectangle of the source image to draw into the destination context.
+     * @param sw - The width of the sub-rectangle of the source image to draw into the destination context.
+     * @param sh - The height of the sub-rectangle of the source image to draw into the destination context.
+     * @returns A promise that resolves with an object containing the loaded image and whether alpha was premultiplied.
+     */
+    abstract createImage(blob: Blob, premultiplyAlpha: boolean, sx?: number | null, sy?: number | null, sw?: number | null, sh?: number | null): Promise<ImageResponse>;
+    /**
+     * Loads an SVG image from a URL and returns it as an ImageBitmap or HTMLImageElement.
+     * @param src - The source URL of the SVG image to load.
+     * @param width - The width to render the SVG image.
+     * @param height - The height to render the SVG image.
+     * @param sx - The x coordinate of the top left corner of the sub-rectangle of the source image to draw into the destination context.
+     * @param sy - The y coordinate of the top left corner of the sub-rectangle of the source image to draw into the destination context.
+     * @param sw - The width of the sub-rectangle of the source image to draw into the destination context.
+     * @param sh - The height of the sub-rectangle of the source image to draw into the destination context.
+     */
+    abstract loadSvg(src: string, width: number | null, height: number | null, sx?: number | null, sy?: number | null, sw?: number | null, sh?: number | null): Promise<ImageResponse>;
+    /**
+     * Loads a compressed texture from a URL and returns it as an ImageBitmap or HTMLImageElement.
+     * @param src - The source URL of the compressed texture to load.
+     * @returns A promise that resolves with an object containing the loaded image and whether alpha was premultiplied.
+     */
+    abstract loadCompressedTexture(src: string): Promise<ImageResponse>;
+    /**
+     * Retrieves the current timestamp.
+     * @returns The current timestamp.
+     */
+    abstract getTimeStamp(): number;
+    /**
+     * Adds a FontFace to the platforms FontFaceSet
+     * @param font - The FontFace to add
+     */
+    abstract addFont(font: FontFace): void;
+    /**
+     * Loads a font by URL and registers it for use with canvas rendering.
+     *
+     * @remarks
+     * Platform implementations may override this to use a browser-compatible
+     * font loading strategy. The default implementation (in {@link WebPlatform})
+     * uses the `FontFace` JavaScript API. Legacy platforms should override this
+     * to use CSS `@font-face` injection, which is supported by all browsers.
+     *
+     * @param fontFamily - The CSS font-family name to register the font under
+     * @param fontUrl - The URL of the font file (e.g. `.ttf`, `.woff`, `.woff2`)
+     * @returns A promise that resolves with the loaded `FontFace` object, or
+     * `null` if the platform used an alternative loading strategy (e.g. CSS
+     * injection) that does not produce a `FontFace` instance.
+     */
+    abstract loadFontFace(fontFamily: string, fontUrl: string): Promise<FontFace | null>;
+}

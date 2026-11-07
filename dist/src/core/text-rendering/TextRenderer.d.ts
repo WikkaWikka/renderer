@@ -1,0 +1,522 @@
+import type { CoreTextNode, CoreTextNodeProps } from '../CoreTextNode.js';
+import type { WebGlCtxTexture } from '../renderers/webgl/WebGlCtxTexture.js';
+import type { Stage } from '../Stage.js';
+import type { CoreRenderer } from '../renderers/CoreRenderer.js';
+import type { RectWithValid } from '../lib/utils.js';
+import type { Dimensions } from '../../common/CommonTypes.js';
+export type TextBaseline = 'alphabetic' | 'hanging' | 'middle' | 'ideographic' | 'bottom';
+export type TextVerticalAlign = 'top' | 'middle' | 'bottom';
+export type TextRenderers = 'canvas' | 'sdf';
+/**
+ * Structure mapping font family names to a set of font faces.
+ */
+export interface FontFamilyMap {
+    [familyName: string]: FontFace;
+}
+/**
+ * Font metrics used for layout and default line height calculations.
+ */
+export interface FontMetrics {
+    /**
+     * The distance, in font units, from the baseline to the highest point of the font.
+     */
+    ascender: number;
+    /**
+     * The distance, in font units, from the baseline to the lowest point of the font.
+     */
+    descender: number;
+    /**
+     * The additional space used in the calculation of the default line height in font units.
+     */
+    lineGap: number;
+    /**
+     * The number of font units per 1 EM.
+     */
+    unitsPerEm: number;
+}
+/**
+ * Normalized font metrics where values are expressed as a fraction of 1 EM.
+ */
+export interface NormalizedFontMetrics {
+    /**
+     * The distance, as a fraction of 1 EM, from the baseline to the highest point of the font.
+     */
+    ascender: number;
+    /**
+     * The distance, as a fraction of 1 EM, from the baseline to the lowest point of the font.
+     */
+    descender: number;
+    /**
+     * The additional space used in the calculation of the default line height as a fraction of 1 EM
+     */
+    lineGap: number;
+}
+/**
+ * Text renderer properties that are used in resolving appropriate font faces
+ *
+ * @remarks
+ * Extended by {@link TrProps}
+ */
+export interface TrFontProps {
+    /**
+     * Font Family
+     *
+     * @internalRemarks
+     * `fontFamily` is defined currently as single string, but in the future we may want to
+     * support multiple font family fallbacks, as this is supported by CSS / Canvas2d. We can
+     * do this in a backwards compatible way by unioning an array of strings to the
+     * `fontFamily` property.
+     */
+    fontFamily: string;
+    /**
+     * Font Style
+     *
+     * @remarks
+     * The font style to use when looking up the font face. This can be one of the
+     * following strings:
+     * - `'normal'`
+     * - `'italic'`
+     * - `'oblique'`
+     */
+    fontStyle: 'normal' | 'italic' | 'oblique';
+    /**
+     * Font Size
+     *
+     * @remarks
+     * The font size to use when looking up the font face.
+     *
+     * The font size is specified in pixels and is the height of the font's
+     * em-square. The em-square is essentially the height of the capital letters
+     * for the font. The actual height of the text can be larger than the
+     * specified font size, as the font may have ascenders and descenders that
+     * extend beyond the em-square.
+     *
+     * @default 16
+     */
+    fontSize: number;
+}
+export interface TrProps extends TrFontProps {
+    /**
+     * Text to display
+     *
+     * @default ''
+     */
+    text: string;
+    /**
+     * Text alignment
+     *
+     * @remarks
+     * Alignment of the text relative to it's contained bounds. For best results,
+     * use {@link contain} mode `'width'` or `'both'` and a set an explicit
+     * {@link width} for the text to be aligned within.
+     *
+     * @default 'left'
+     */
+    textAlign: 'left' | 'center' | 'right';
+    /**
+     * Color of text
+     *
+     * @remarks
+     * The color value is a number in the format 0xRRGGBBAA, where RR is the red
+     * component, GG is the green component, BB is the blue component, and AA is
+     * the alpha component.
+     *
+     * @default 0xffffffff (opaque white)
+     */
+    color: number;
+    x: number;
+    y: number;
+    maxWidth: number;
+    maxHeight: number;
+    /**
+     * Vertical offset for text
+     *
+     * @remarks
+     * The vertical offset of the text.
+     *
+     * @default 0
+     */
+    offsetY: number;
+    /**
+     * Letter spacing for text (in pixels)
+     *
+     * @remarks
+     * This property sets additional (or reduced, if value is negative) spacing
+     * between characters in the text.
+     *
+     * @default 0
+     */
+    letterSpacing: number;
+    /**
+     * Line height for text (in pixels)
+     *
+     * @remarks
+     * This property sets the height of each line. If set to `undefined`, the
+     * line height will be calculated based on the font and font size to be the
+     * minimal height required to completely contain a line of text.
+     *
+     * See: https://github.com/lightning-js/renderer/issues/170
+     *
+     * @default `undefined`
+     */
+    lineHeight: number;
+    /**
+     * Max lines for text
+     *
+     * @remarks
+     * This property sets max number of lines of a text paragraph.
+     * Not yet implemented in the SDF renderer.
+     *
+     * @default 0
+     */
+    maxLines: number;
+    /**
+     * Vertical Align for text when lineHeight > fontSize
+     *
+     * @remarks
+     * This property sets the vertical align of the text.
+     * Not yet implemented in the SDF renderer.
+     *
+     * @default middle
+     */
+    verticalAlign: TextVerticalAlign;
+    /**
+     * Overflow Suffix for text
+     *
+     * @remarks
+     * The suffix to be added when text is cropped due to overflow.
+     * Not yet implemented in the SDF renderer.
+     *
+     * @default "..."
+     */
+    overflowSuffix: string;
+    /**
+     * Word Break for text
+     *
+     * @remarks
+     * This property sets how words should break when reaching the end of a line.
+     *
+     * - `'overflow'`: Uses the Css/HTML normal word-break behavior, generally not used in app development.
+     * - `'break-all'`: To prevent overflow, word breaks should happen between any two characters.
+     * - `'break-word'`: To prevent overflow, word breaks should happen between words. If words are too long word breaks happen between any two characters.
+     *
+     * @default "break-word"
+     */
+    wordBreak: 'overflow' | 'break-all' | 'break-word';
+    /**
+     * contain mode for text
+     *
+     * @remarks
+     *
+     * This property sets how the text should be contained within its bounding box.
+     *
+     * - 'width': The text is contained within the specified maxWidth, horizontal position of text will adjust according to {@link textAlign}.
+     * - 'height': The text is contained within the specified maxHeight, vertical position of text will adjust according to {@link verticalAlign}.
+     * - 'both': The text is contained within both the specified maxWidth and maxHeight.
+     * - 'none': The text is not contained within any bounding box.
+     *
+     * @default 'none'
+     */
+    contain: 'width' | 'height' | 'both' | 'none';
+    /**
+     * Enable BB-code rich text parsing for this text node.
+     *
+     * @remarks
+     *
+     * When `true`, the {@link text} string is parsed for BB-code tags before
+     * layout and rendering. Supported tags:
+     *
+     * - `[b]…[/b]` — bold
+     * - `[i]…[/i]` — italic
+     * - `[u]…[/u]` — underline
+     * - `[s]…[/s]` — strikethrough
+     * - `[color=0xRRGGBBAA]…[/color]` — inline color (must use the renderer's
+     *   internal `0xRRGGBBAA` hex format, e.g. `[color=0xff0000ff]`)
+     *
+     * Tags are nestable and may be combined freely. Unrecognised or malformed
+     * tags are emitted as literal text. Mis-nested closing tags implicitly close
+     * any intervening open tags.
+     *
+     * When `false` (the default), the `text` string is rendered as-is with no
+     * tag parsing, and there is no performance overhead.
+     *
+     * ### Renderer differences
+     *
+     * **Canvas renderer** — bold and italic use the CSS `bold`/`italic` font
+     * keywords; a matching font face must be registered for best results.
+     *
+     * **SDF renderer** — bold is a per-vertex SDF threshold shift (fake bold,
+     * no extra atlas required); italic is a layout-time vertex shear of tan(14°)
+     * relative to the alphabetic baseline (fake italic, no extra atlas required).
+     *
+     * @see {@link https://github.com/lightning-js/renderer/blob/main/docs/rich-text.md | Rich Text docs}
+     *
+     * @default false
+     */
+    richText: boolean;
+}
+/**
+ * Glyph layout information for WebGL rendering
+ */
+export interface GlyphLayout {
+    /**
+     * X position relative to text origin
+     */
+    x: number;
+    /**
+     * Y position relative to text origin
+     */
+    y: number;
+    /**
+     * Width of glyph in font units
+     */
+    width: number;
+    /**
+     * Height of glyph in font units
+     */
+    height: number;
+    /**
+     * Atlas texture coordinates (normalized 0-1)
+     */
+    atlasX: number;
+    atlasY: number;
+    atlasWidth: number;
+    atlasHeight: number;
+}
+/**
+ * Complete text layout information for caching
+ */
+export interface TextLayout {
+    /**
+     * Packed per-glyph design-unit records consumed by the renderer's batched
+     * SDF write paths (one record per quad, including decoration quads).
+     *
+     * plain (8 floats): x, y, w, h, u, v, uw, vh
+     * rich  (12 floats): x, y, w, h, u, v, uw, vh, shearTop, shearBot, packed_span_color, style
+     *
+     * `shearTop` / `shearBot` are the per-corner x-deltas of the italic lean;
+     * `u = -1.0` with `uw = 0` marks a solid-fill decoration quad.
+     */
+    glyphs: Float32Array;
+    /**
+     * Number of glyph records (quads) in `glyphs`.
+     */
+    glyphCount: number;
+    /**
+     * Total quad count (glyphs + decoration rects). Equals `glyphCount`; kept
+     * for backward compatibility with callers that read the quad total.
+     */
+    totalQuadCount: number;
+    /**
+     * Whether this layout was generated for richText mode.
+     * Determines the vertex format: false = 4 floats/vertex (plain), true = 6 floats/vertex (rich).
+     */
+    richText: boolean;
+    /**
+     * Total text width
+     */
+    width: number;
+    /**
+     * Total text height
+     */
+    height: number;
+    /**
+     * Font scale factor
+     */
+    fontScale: number;
+    /**
+     * Line height
+     */
+    lineHeight: number;
+    /**
+     * Font family used
+     */
+    fontFamily: string;
+    /**
+     * distanceRange used
+     */
+    distanceRange: number;
+    /**
+     * number of lines that exceeded maxHeight and were truncated
+     */
+    remainingLines: number;
+    /**
+     * Whether there is remaining text that exceeded maxHeight and was truncated
+     */
+    hasRemainingText: boolean;
+}
+export interface FontLoadOptions {
+    fontFamily: string;
+    metrics?: FontMetrics;
+    fontUrl?: string;
+    atlasUrl?: string;
+    atlasDataUrl?: string;
+}
+/**
+ * Measure Width of Text function to be defined in font handlers, used in TextLayoutEngine
+ *
+ * @param text The substring to measure.
+ * @param fontFamily Font family; ignored by the Canvas handler, which measures
+ * against a shared context.
+ * @param letterSpacing Additional spacing per character.
+ * @param start Absolute index of `text` within the text passed to
+ * {@link mapTextLayout}. Style-aware implementations use it to look up the
+ * rich text spans covering this substring so bold and italic runs are measured
+ * with the face they will actually be drawn with. Omitted, or negative, means
+ * the caller cannot locate the substring in the source (an overflow suffix, for
+ * example) and the base font should be used.
+ */
+export type MeasureTextFn = (text: string, fontFamily: string, letterSpacing: number, start?: number) => number;
+export interface FontHandler {
+    init: (c: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D) => void;
+    type: 'canvas' | 'sdf';
+    isFontLoaded: (fontFamily: string) => boolean;
+    loadFont: (stage: Stage, options: FontLoadOptions) => Promise<void>;
+    /**
+     * Start loading a previously registered font family if it hasn't started.
+     *
+     * @remarks
+     * Optional so third-party handlers keep working without it. Used to
+     * trigger first-use loads; must be cheap and idempotent. No-op for
+     * unknown families.
+     */
+    requestLoad?: (stage: Stage, fontFamily: string) => void;
+    /**
+     * Eagerly load a font, resolving only after it is renderable.
+     *
+     * @remarks
+     * Optional; when absent, `Stage.preloadFont` falls back to `loadFont`.
+     */
+    preloadFont?: (stage: Stage, options: FontLoadOptions) => Promise<void>;
+    waitingForFont: (fontFamily: string, node: CoreTextNode) => void;
+    stopWaitingForFont: (fontFamily: string, node: CoreTextNode) => void;
+    getFontFamilies: () => FontFamilyMap;
+    canRenderFont: (trProps: TrProps) => boolean;
+    getFontMetrics: (fontFamily: string, fontSize: number) => NormalizedFontMetrics;
+    measureText: MeasureTextFn;
+}
+export interface TextRenderProps {
+    fontFamily: string;
+    fontSize: number;
+    color: number;
+    offsetY: number;
+    worldAlpha: number;
+    globalTransform: Float32Array;
+    clippingRect: RectWithValid;
+    width: number;
+    height: number;
+    parentHasRenderTexture: boolean;
+    framebufferDimensions: Dimensions | null;
+    stage: Stage;
+    /** Optional SDF vertex cache — passed by CoreTextNode for the cache-hit fast path. */
+    sdfCache?: SdfVertexCache;
+}
+/**
+ * Cached SDF vertex data for a single text node.
+ * When nothing changes (layout, transform, color, alpha), the pre-transformed
+ * vertex Float32Array can be mem-copied into the shared SDF buffer instead of
+ * re-computing per-glyph matrix transforms each frame.
+ */
+export interface SdfVertexCache {
+    /** Pre-transformed vertex Float32Array in the target SDF buffer's GPU layout (null = cache miss). */
+    vertices: Float32Array | null;
+    /** Number of glyphs (quads) in the cached data. */
+    glyphCount: number;
+    /** RGBA color at the time the cache was built. */
+    color: number;
+    /** worldAlpha at the time the cache was built. */
+    alpha: number;
+    /** The 6 relevant transform matrix components [m0,m1,m3,m4,m6,m7]. */
+    transform: Float32Array;
+    /** Reference to the TextLayout the cache was built from. */
+    layoutRef: TextLayout | null;
+    /**
+     * Quad index in the shared SDF buffer where the cached vertices were last
+     * written. A cache hit that would land at a different offset than this (a
+     * render-list reorder or layout change elsewhere in the buffer) means the
+     * GPU copy is stale at both the old and new offsets, so the buffer must be
+     * re-uploaded even though every write was a bit-exact mem-copy.
+     */
+    lastStartQuad: number;
+    /**
+     * Whether the last write this node made to the shared buffer was NOT a
+     * bit-exact re-write of the bytes the GPU holds at `lastStartQuad` (e.g.
+     * the translated fast path shifted the positions). Forces a re-upload the
+     * next time the node takes the exact cache-hit path.
+     */
+    lastWriteDirty: boolean;
+}
+export interface RenderInfo {
+    width: number;
+    height: number;
+    hasRemainingText: boolean;
+    remainingLines: number;
+}
+export type SdfRenderInfo = RenderInfo & {
+    type: 'sdf';
+    layout: TextLayout;
+    atlasTexture: WebGlCtxTexture;
+};
+export type CanvasRenderInfo = RenderInfo & {
+    type: 'canvas';
+    renderSource: () => ImageBitmap | HTMLCanvasElement | null;
+};
+export type TextRenderInfo = SdfRenderInfo | CanvasRenderInfo;
+export interface TextRenderer {
+    type: 'canvas' | 'sdf';
+    font: FontHandler;
+    renderText: (props: CoreTextNodeProps) => TextRenderInfo;
+    renderQuads: (renderer: CoreRenderer, layout: TextLayout, vertexBuffer: Float32Array | null, renderProps: TextRenderProps) => void;
+    init: (stage: Stage) => void;
+    clearCache: () => void;
+}
+/**
+ * Text line struct for text mapping
+ * 0 - text
+ * 1 - width
+ * 2 - truncated
+ * 3 - line offset x
+ * 4 - line offset y
+ * 5 - absolute start index of this line within the (stripped) source text
+ *
+ * @remarks
+ * Index 5 is the character offset at which this line's first character appears
+ * in the text that was handed to {@link mapTextLayout}. For rich text this is
+ * the *stripped* text (BB-code tags removed), which is the same coordinate
+ * space the {@link RichSpan} start/end offsets use.
+ *
+ * It cannot be derived by accumulating line lengths at the consumer: the word
+ * wrapper collapses runs of whitespace, so the number of source characters
+ * consumed between two layout lines is not always one. Consumers that need to
+ * correlate a line back to its spans must read this field.
+ *
+ * For truncated lines the text may contain an appended overflow suffix that has
+ * no counterpart in the source, so `text.length` is not a reliable span length.
+ */
+export type TextLineStruct = [string, number, boolean, number, number, number];
+/**
+ * Wrapped lines struct for text mapping
+ * 0 - line structs
+ * 1 - remaining lines
+ * 2 - remaining text
+ */
+export type WrappedLinesStruct = [TextLineStruct[], number, boolean];
+/**
+ * Wrapped lines struct for text mapping
+ * 0 - line structs
+ * 1 - remaining lines
+ * 2 - remaining text
+ * 3 - bare line height
+ * 4 - line height pixels
+ * 5 - effective width
+ * 6 - effective height
+ */
+export type TextLayoutStruct = [
+    TextLineStruct[],
+    number,
+    boolean,
+    number,
+    number,
+    number,
+    number
+];

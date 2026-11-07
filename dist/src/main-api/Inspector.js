@@ -1,0 +1,894 @@
+import { CoreNode, } from '../core/CoreNode.js';
+import {} from './Renderer.js';
+import { isProductionEnvironment } from '../utils.js';
+import { CoreTextNode } from '../core/CoreTextNode.js';
+import { TextureType } from '../core/textures/Texture.js';
+const stylePropertyMap = {
+    alpha: (v) => {
+        return { prop: 'opacity', value: v === 1 ? null : `${v}` };
+    },
+    x: (x) => {
+        return { prop: 'left', value: `${x}px` };
+    },
+    y: (y) => {
+        return { prop: 'top', value: `${y}px` };
+    },
+    w: (w) => {
+        if (w === 0) {
+            return { prop: 'width', value: 'auto' };
+        }
+        return { prop: 'width', value: `${w}px` };
+    },
+    h: (h) => {
+        if (h === 0) {
+            return { prop: 'height', value: 'auto' };
+        }
+        return { prop: 'height', value: `${h}px` };
+    },
+    fontSize: (fs) => {
+        return { prop: 'font-size', value: fs === 0 ? null : `${fs}px` };
+    },
+    lineHeight: (lh) => {
+        return { prop: 'line-height', value: lh === 0 ? null : `${lh}px` };
+    },
+    zIndex: () => 'z-index',
+    fontFamily: () => 'font-family',
+    fontStyle: () => 'font-style',
+    letterSpacing: () => 'letter-spacing',
+    textAlign: () => 'text-align',
+    overflowSuffix: () => 'overflow-suffix',
+    maxLines: () => 'max-lines',
+    contain: () => 'contain',
+    verticalAlign: () => 'vertical-align',
+    clipping: (v) => {
+        return { prop: 'overflow', value: v === false ? null : 'hidden' };
+    },
+    rotation: () => {
+        return { prop: 'transform', value: '' };
+    },
+    scale: () => {
+        return { prop: 'transform', value: '' };
+    },
+    scaleX: () => {
+        return { prop: 'transform', value: '' };
+    },
+    scaleY: () => {
+        return { prop: 'transform', value: '' };
+    },
+    color: (v) => {
+        return {
+            prop: 'color',
+            value: v === 0 ? null : convertColorToRgba(v),
+        };
+    },
+};
+const convertColorToRgba = (color) => {
+    const a = (color & 0xff) / 255;
+    const b = (color >> 8) & 0xff;
+    const g = (color >> 16) & 0xff;
+    const r = (color >> 24) & 0xff;
+    return `rgba(${r},${g},${b},${a})`;
+};
+const domPropertyMap = {
+    id: 'test-id',
+};
+/**
+const gradientColorPropertyMap = [
+  'colorTop',
+  'colorBottom',
+  'colorLeft',
+  'colorRight',
+  'colorTl',
+  'colorTr',
+  'colorBl',
+  'colorBr',
+];
+*/
+const textureTypeNames = {
+    [TextureType.generic]: 'generic',
+    [TextureType.color]: 'color',
+    [TextureType.image]: 'image',
+    [TextureType.noise]: 'noise',
+    [TextureType.renderToTexture]: 'renderToTexture',
+    [TextureType.subTexture]: 'subTexture',
+};
+const knownProperties = new Set([
+    ...Object.keys(stylePropertyMap),
+    ...Object.keys(domPropertyMap),
+    // ...gradientColorPropertyMap,
+    'src',
+    'parent',
+    'data',
+    'text',
+    'mount',
+    'mountX',
+    'mountY',
+]);
+export class Inspector {
+    root = null;
+    canvas = null;
+    mutationObserver = new MutationObserver(() => { });
+    resizeObserver = new ResizeObserver(() => { });
+    height = 1080;
+    width = 1920;
+    scaleX = 1;
+    scaleY = 1;
+    textureMetrics = new Map();
+    // Performance monitoring for frequent setter calls
+    static setterCallCount = new Map();
+    // Animation monitoring structures
+    static activeAnimations = new Map();
+    static animationHistory = [];
+    // Performance monitoring settings (configured via constructor)
+    performanceSettings = {
+        enablePerformanceMonitoring: false,
+        excessiveCallThreshold: 100,
+        resetInterval: 5000,
+        enableAnimationMonitoring: false,
+        maxAnimationHistory: 1000,
+        animationStatsInterval: 0,
+    };
+    // Animation stats printing timer
+    animationStatsTimer = null;
+    constructor(canvas, settings) {
+        if (isProductionEnvironment === true)
+            return;
+        if (!settings) {
+            throw new Error('settings is required');
+        }
+        // Initialize performance monitoring settings with defaults
+        this.performanceSettings = {
+            enablePerformanceMonitoring: settings.inspectorOptions?.enablePerformanceMonitoring ?? false,
+            excessiveCallThreshold: settings.inspectorOptions?.excessiveCallThreshold ?? 100,
+            resetInterval: settings.inspectorOptions?.resetInterval ?? 5000,
+            enableAnimationMonitoring: settings.inspectorOptions?.enableAnimationMonitoring ?? false,
+            maxAnimationHistory: settings.inspectorOptions?.maxAnimationHistory ?? 1000,
+            animationStatsInterval: settings.inspectorOptions?.animationStatsInterval ?? 0,
+        };
+        // calc dimensions based on the devicePixelRatio
+        this.height = Math.ceil(settings.appHeight ?? 1080 / (settings.deviceLogicalPixelRatio ?? 1));
+        this.width = Math.ceil(settings.appWidth ?? 1920 / (settings.deviceLogicalPixelRatio ?? 1));
+        this.scaleX = settings.deviceLogicalPixelRatio ?? 1;
+        this.scaleY = settings.deviceLogicalPixelRatio ?? 1;
+        this.canvas = canvas;
+        this.root = document.createElement('div');
+        this.setRootPosition();
+        document.body.appendChild(this.root);
+        //listen for changes on canvas
+        this.mutationObserver = new MutationObserver(this.setRootPosition.bind(this));
+        this.mutationObserver.observe(canvas, {
+            attributes: true,
+            childList: false,
+            subtree: false,
+        });
+        // Create a ResizeObserver to watch for changes in the element's size
+        this.resizeObserver = new ResizeObserver(this.setRootPosition.bind(this));
+        this.resizeObserver.observe(canvas);
+        //listen for changes on window
+        window.addEventListener('resize', this.setRootPosition.bind(this));
+        // Start animation stats timer if enabled
+        this.startAnimationStatsTimer();
+        console.warn('Inspector is enabled, this will impact performance');
+    }
+    /**
+     * Track setter calls for performance monitoring
+     * Only active when Inspector is loaded
+     */
+    trackSetterCall(nodeId, setterName) {
+        if (!this.performanceSettings.enablePerformanceMonitoring) {
+            return;
+        }
+        const key = `${nodeId}_${setterName}`;
+        const now = Date.now();
+        const existing = Inspector.setterCallCount.get(key);
+        if (!existing) {
+            Inspector.setterCallCount.set(key, { count: 1, lastReset: now, nodeId });
+            return;
+        }
+        // Reset counter if enough time has passed
+        if (now - existing.lastReset > this.performanceSettings.resetInterval) {
+            existing.count = 1;
+            existing.lastReset = now;
+            return;
+        }
+        existing.count++;
+        // Log if threshold exceeded
+        if (existing.count === this.performanceSettings.excessiveCallThreshold) {
+            console.warn(`🚨 Inspector Performance Warning: Setter '${setterName}' called ${existing.count} times in ${this.performanceSettings.resetInterval}ms on node ${nodeId}`);
+        }
+        else if (existing.count > this.performanceSettings.excessiveCallThreshold &&
+            existing.count % 50 === 0) {
+            console.warn(`🚨 Inspector Performance Warning: Setter '${setterName}' called ${existing.count} times in ${this.performanceSettings.resetInterval}ms on node ${nodeId} (continuing...)`);
+        }
+    }
+    /**
+     * Get current performance monitoring statistics
+     */
+    static getPerformanceStats() {
+        const stats = [];
+        const now = Date.now();
+        Inspector.setterCallCount.forEach((data, key) => {
+            const parts = key.split('_');
+            const nodeIdStr = parts[0];
+            const setterName = parts[1];
+            if (nodeIdStr && setterName) {
+                const timeWindow = now - data.lastReset;
+                stats.push({
+                    nodeId: parseInt(nodeIdStr, 10),
+                    setterName,
+                    count: data.count,
+                    timeWindow,
+                });
+            }
+        });
+        return stats.sort((a, b) => b.count - a.count);
+    }
+    /**
+     * Clear performance monitoring statistics
+     */
+    static clearPerformanceStats() {
+        Inspector.setterCallCount.clear();
+    }
+    /**
+     * Generate a unique animation ID
+     */
+    static generateAnimationId() {
+        return `anim_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    }
+    /**
+     * Wrap animation controller with monitoring capabilities
+     */
+    wrapAnimationController(controller, nodeId, props, settings, div) {
+        if (!this.performanceSettings.enableAnimationMonitoring) {
+            // Just add the basic DOM animation without tracking
+            const originalStart = controller.start.bind(controller);
+            controller.start = () => {
+                this.animateNode(div, props, settings);
+                return originalStart();
+            };
+            return controller;
+        }
+        const animationId = Inspector.generateAnimationId();
+        // Create wrapper controller
+        const wrappedController = {
+            start: () => {
+                this.trackAnimationStart(animationId, nodeId, props, settings, controller);
+                this.animateNode(div, props, settings);
+                return controller.start();
+            },
+            stop: () => {
+                this.trackAnimationEnd(animationId, 'stopped');
+                return controller.stop();
+            },
+            pause: () => {
+                this.updateAnimationState(animationId, 'paused');
+                return controller.pause();
+            },
+            restore: () => {
+                this.trackAnimationEnd(animationId, 'cancelled');
+                return controller.restore();
+            },
+            waitUntilStopped: () => {
+                return controller.waitUntilStopped().then(() => {
+                    this.trackAnimationEnd(animationId, 'finished');
+                });
+            },
+            get state() {
+                return controller.state;
+            },
+            // Event emitter methods
+            on: controller.on.bind(controller),
+            off: controller.off.bind(controller),
+            once: controller.once.bind(controller),
+            emit: controller.emit.bind(controller),
+        };
+        // Track animation events
+        controller.on('animating', () => {
+            this.updateAnimationState(animationId, 'running');
+        });
+        controller.on('stopped', () => {
+            this.trackAnimationEnd(animationId, 'finished');
+        });
+        return wrappedController;
+    }
+    /**
+     * Track animation start
+     */
+    trackAnimationStart(animationId, nodeId, props, settings, controller) {
+        const startTime = Date.now();
+        Inspector.activeAnimations.set(animationId, {
+            nodeId,
+            animationId,
+            startTime,
+            props,
+            settings,
+            controller,
+            state: 'scheduled',
+        });
+    }
+    /**
+     * Update animation state
+     */
+    updateAnimationState(animationId, state) {
+        const animation = Inspector.activeAnimations.get(animationId);
+        if (animation) {
+            animation.state = state;
+        }
+    }
+    /**
+     * Track animation end
+     */
+    trackAnimationEnd(animationId, completionType) {
+        const animation = Inspector.activeAnimations.get(animationId);
+        if (!animation)
+            return;
+        const endTime = Date.now();
+        const actualDuration = endTime - animation.startTime;
+        const expectedDuration = animation.settings.duration || 1000;
+        // Move to history
+        Inspector.animationHistory.unshift({
+            nodeId: animation.nodeId,
+            animationId: animation.animationId,
+            startTime: animation.startTime,
+            endTime,
+            duration: expectedDuration,
+            actualDuration,
+            props: animation.props,
+            settings: animation.settings,
+            completionType,
+        });
+        // Limit history size for performance
+        if (Inspector.animationHistory.length >
+            this.performanceSettings.maxAnimationHistory) {
+            Inspector.animationHistory.splice(this.performanceSettings.maxAnimationHistory);
+        }
+        // Remove from active animations
+        Inspector.activeAnimations.delete(animationId);
+    }
+    /**
+     * Get currently active animations
+     */
+    static getActiveAnimations() {
+        const now = Date.now();
+        const activeAnimations = [];
+        Inspector.activeAnimations.forEach((animation) => {
+            activeAnimations.push({
+                nodeId: animation.nodeId,
+                animationId: animation.animationId,
+                startTime: animation.startTime,
+                duration: animation.settings.duration || 1000,
+                elapsedTime: now - animation.startTime,
+                props: animation.props,
+                settings: animation.settings,
+                state: animation.state,
+            });
+        });
+        return activeAnimations.sort((a, b) => b.startTime - a.startTime);
+    }
+    /**
+     * Get animation statistics
+     */
+    static getAnimationStats() {
+        const totalAnimations = Inspector.animationHistory.length;
+        const activeCount = Inspector.activeAnimations.size;
+        // Calculate average duration from finished animations only
+        const finishedAnimations = Inspector.animationHistory.filter((anim) => anim.completionType === 'finished');
+        const averageDuration = finishedAnimations.length > 0
+            ? finishedAnimations.reduce((sum, anim) => sum + anim.actualDuration, 0) / finishedAnimations.length
+            : 0;
+        return {
+            totalAnimations,
+            activeCount,
+            averageDuration,
+        };
+    }
+    /**
+     * Clear animation monitoring data
+     */
+    static clearAnimationStats() {
+        Inspector.activeAnimations.clear();
+        Inspector.animationHistory.length = 0;
+    }
+    /**
+     * Start the animation stats timer if enabled
+     */
+    startAnimationStatsTimer() {
+        console.log(`Starting animation stats timer with interval: ${this.performanceSettings.animationStatsInterval} seconds`);
+        if (this.performanceSettings.animationStatsInterval > 0) {
+            this.animationStatsTimer = setInterval(() => {
+                this.printAnimationStats();
+            }, this.performanceSettings.animationStatsInterval * 1000);
+        }
+    }
+    /**
+     * Stop the animation stats timer
+     */
+    stopAnimationStatsTimer() {
+        if (this.animationStatsTimer) {
+            clearInterval(this.animationStatsTimer);
+            this.animationStatsTimer = null;
+        }
+    }
+    /**
+     * Print current animation statistics to console
+     */
+    printAnimationStats() {
+        const stats = Inspector.getAnimationStats();
+        console.log(`🎬 Animation Stats: ${stats.activeCount} active, ${stats.totalAnimations} completed, ${Math.round(stats.averageDuration)}ms avg duration`);
+    }
+    setRootPosition() {
+        if (this.root === null || this.canvas === null) {
+            return;
+        }
+        // get the world position of the canvas object, so we can match the inspector to it
+        const rect = this.canvas.getBoundingClientRect();
+        const top = document.documentElement.scrollTop + rect.top;
+        const left = document.documentElement.scrollLeft + rect.left;
+        this.root.id = 'root';
+        this.root.style.left = `${left}px`;
+        this.root.style.top = `${top}px`;
+        this.root.style.width = `${this.width}px`;
+        this.root.style.height = `${this.height}px`;
+        this.root.style.position = 'absolute';
+        this.root.style.transformOrigin = '0 0 0';
+        this.root.style.transform = `scale(${this.scaleX}, ${this.scaleY})`;
+        this.root.style.overflow = 'hidden';
+        this.root.style.zIndex = '65534';
+    }
+    createDiv(node, properties) {
+        const div = document.createElement('div');
+        div.style.position = 'absolute';
+        div.id = node.id.toString();
+        div.setAttribute('type', node.constructor.name);
+        // set initial properties
+        for (const key in properties) {
+            this.updateNodeProperty(div, 
+            // really typescript? really?
+            key, properties[key], properties);
+        }
+        return div;
+    }
+    createNodes(node) {
+        if (this.root === null) {
+            return false;
+        }
+        const div = this.root.querySelector(`[id="${node.id}"]`);
+        if (div === null && node instanceof CoreTextNode) {
+            this.createTextNode(node);
+        }
+        else if (div === null && node instanceof CoreNode) {
+            this.createNode(node);
+        }
+        for (const child of node.children) {
+            this.createNodes(child);
+        }
+        return true;
+    }
+    createNode(node) {
+        const div = this.createDiv(node, node.props);
+        div.node = node;
+        node.div = div;
+        node.on('inViewport', () => div.setAttribute('state', 'inViewport'));
+        node.on('inBounds', () => div.setAttribute('state', 'inBounds'));
+        node.on('outOfBounds', () => div.setAttribute('state', 'outOfBounds'));
+        // Monitor only relevant properties by trapping with selective assignment
+        return this.createProxy(node, div);
+    }
+    createTextNode(node) {
+        const div = this.createDiv(node, node.textProps);
+        div.node = node;
+        node.div = div;
+        return this.createProxy(node, div);
+    }
+    createProxy(node, div) {
+        // Store texture event listeners for cleanup
+        const textureListeners = new Map();
+        const coreNodeListeners = new Map();
+        const setupCoreNodeListeners = (coreNode) => {
+            const onLoaded = () => {
+                this.updateTextNodeDimensions(div, coreNode);
+            };
+            coreNode.on('loaded', onLoaded);
+            coreNodeListeners.set(coreNode, { onLoaded });
+        };
+        // Helper function to setup texture event listeners
+        const setupTextureListeners = (texture) => {
+            // Clean up existing listeners first
+            textureListeners.forEach((listeners, oldTexture) => {
+                oldTexture.off('loaded', listeners.onLoaded);
+                oldTexture.off('failed', listeners.onFailed);
+                oldTexture.off('freed', listeners.onFreed);
+            });
+            textureListeners.clear();
+            // Setup new listeners if texture exists
+            if (texture) {
+                // Initialize metrics if not exists
+                if (!this.textureMetrics.has(texture)) {
+                    this.textureMetrics.set(texture, {
+                        previousState: texture.state,
+                        loadedCount: 0,
+                        failedCount: 0,
+                        freedCount: 0,
+                    });
+                }
+                const onLoaded = () => {
+                    const metrics = this.textureMetrics.get(texture);
+                    if (metrics) {
+                        metrics.previousState =
+                            metrics.previousState !== texture.state
+                                ? metrics.previousState
+                                : 'loading';
+                        metrics.loadedCount++;
+                    }
+                    this.updateTextureAttributes(div, texture);
+                };
+                const onFailed = () => {
+                    const metrics = this.textureMetrics.get(texture);
+                    if (metrics) {
+                        metrics.previousState =
+                            metrics.previousState !== texture.state
+                                ? metrics.previousState
+                                : 'loading';
+                        metrics.failedCount++;
+                    }
+                    this.updateTextureAttributes(div, texture);
+                };
+                const onFreed = () => {
+                    const metrics = this.textureMetrics.get(texture);
+                    if (metrics) {
+                        metrics.previousState =
+                            metrics.previousState !== texture.state
+                                ? metrics.previousState
+                                : texture.state;
+                        metrics.freedCount++;
+                    }
+                    this.updateTextureAttributes(div, texture);
+                };
+                texture.on('loaded', onLoaded);
+                texture.on('failed', onFailed);
+                texture.on('freed', onFreed);
+                textureListeners.set(texture, { onLoaded, onFailed, onFreed });
+            }
+        };
+        // Define traps for each property in knownProperties
+        knownProperties.forEach((property) => {
+            let proto = node;
+            let originalProp = Object.getOwnPropertyDescriptor(proto, property);
+            // Search the prototype chain for the property descriptor
+            while (originalProp === undefined) {
+                proto = Object.getPrototypeOf(proto);
+                if (proto === null) {
+                    return;
+                }
+                originalProp = Object.getOwnPropertyDescriptor(proto, property);
+            }
+            if (property === 'text') {
+                setupCoreNodeListeners(node);
+            }
+            Object.defineProperty(node, property, {
+                get() {
+                    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
+                    return originalProp?.get?.call(node);
+                },
+                set: (value) => {
+                    // Track setter call for performance monitoring
+                    this.trackSetterCall(node.id, property);
+                    originalProp?.set?.call(node, value);
+                    this.updateNodeProperty(div, property, value, node.props);
+                    // Setup texture event listeners if this is a texture property
+                    if (property === 'texture') {
+                        const textureValue = value && typeof value === 'object' && 'state' in value
+                            ? value
+                            : null;
+                        setupTextureListeners(textureValue);
+                    }
+                },
+                configurable: true,
+                enumerable: true,
+            });
+        });
+        const originalDestroy = node.destroy;
+        Object.defineProperty(node, 'destroy', {
+            value: () => {
+                // Clean up texture event listeners and metrics
+                textureListeners.forEach((listeners, texture) => {
+                    texture.off('loaded', listeners.onLoaded);
+                    texture.off('failed', listeners.onFailed);
+                    texture.off('freed', listeners.onFreed);
+                    // Clean up metrics for this texture
+                    this.textureMetrics.delete(texture);
+                });
+                textureListeners.clear();
+                coreNodeListeners.forEach((listeners, coreNode) => {
+                    coreNode.off('loaded', listeners.onLoaded);
+                });
+                coreNodeListeners.clear();
+                // Clean up activeAnimations entries for this node
+                for (const [id, anim] of Inspector.activeAnimations) {
+                    if (anim.nodeId === node.id) {
+                        Inspector.activeAnimations.delete(id);
+                    }
+                }
+                // Remove div from DOM using direct reference (getElementById fails for
+                // children already detached when parent div was removed first)
+                if (div.parentNode) {
+                    div.parentNode.removeChild(div);
+                }
+                // Break circular references between node and div
+                div.node = null;
+                node.div = null;
+                // Call original destroy (recursively destroys renderer children)
+                originalDestroy.call(node);
+                // Remove all defineProperty traps to release closures that capture
+                // node, div, originalProp, and the Inspector instance
+                for (let i = 0; i < knownProperties.size; i++) {
+                    const property = knownProperties[i];
+                    try {
+                        delete node[property];
+                    }
+                    catch (_) {
+                        // Property may not be configurable in rare edge cases
+                    }
+                }
+                try {
+                    delete node.destroy;
+                    delete node.animate;
+                }
+                catch (_) {
+                    // ignore
+                }
+            },
+            configurable: true,
+        });
+        const originalAnimate = node.animate;
+        Object.defineProperty(node, 'animate', {
+            value: (props, settings) => {
+                const animationController = originalAnimate.call(node, props, settings);
+                // Wrap animation controller with monitoring
+                return this.wrapAnimationController(animationController, node.id, props, settings, div);
+            },
+            configurable: true,
+        });
+        return node;
+    }
+    updateTextNodeDimensions(div, node) {
+        const textMetrics = node.renderInfo;
+        if (textMetrics) {
+            div.style.width = `${textMetrics.width}px`;
+            div.style.height = `${textMetrics.height}px`;
+        }
+        else {
+            div.style.removeProperty('width');
+            div.style.removeProperty('height');
+        }
+    }
+    updateTextureAttributes(div, texture) {
+        // Update texture state
+        div.setAttribute('data-texture-state', texture.state);
+        // Update texture type
+        div.setAttribute('data-texture-type', textureTypeNames[texture.type] || 'unknown');
+        // Update texture dimensions if available
+        if (texture.dimensions) {
+            div.setAttribute('data-texture-width', String(texture.dimensions.w));
+            div.setAttribute('data-texture-height', String(texture.dimensions.h));
+        }
+        else {
+            div.removeAttribute('data-texture-width');
+            div.removeAttribute('data-texture-height');
+        }
+        // Update renderable owners count
+        div.setAttribute('data-texture-owners', String(texture.renderableOwners.size));
+        // Update retry count
+        div.setAttribute('data-texture-retry-count', String(texture.retryCount));
+        // Update max retry count if available
+        if (texture.maxRetryCount !== null) {
+            div.setAttribute('data-texture-max-retry-count', String(texture.maxRetryCount));
+        }
+        else {
+            div.removeAttribute('data-texture-max-retry-count');
+        }
+        // Update metrics if available
+        const metrics = this.textureMetrics.get(texture);
+        if (metrics) {
+            div.setAttribute('data-texture-previous-state', metrics.previousState);
+            div.setAttribute('data-texture-loaded-count', String(metrics.loadedCount));
+            div.setAttribute('data-texture-failed-count', String(metrics.failedCount));
+            div.setAttribute('data-texture-freed-count', String(metrics.freedCount));
+        }
+        else {
+            div.removeAttribute('data-texture-previous-state');
+            div.removeAttribute('data-texture-loaded-count');
+            div.removeAttribute('data-texture-failed-count');
+            div.removeAttribute('data-texture-freed-count');
+        }
+        // Update error information if present
+        if (texture.error) {
+            div.setAttribute('data-texture-error', texture.error.code || texture.error.message);
+        }
+        else {
+            div.removeAttribute('data-texture-error');
+        }
+    }
+    destroy() {
+        // Stop animation stats timer
+        this.stopAnimationStatsTimer();
+        // Remove DOM observers
+        this.mutationObserver.disconnect();
+        this.resizeObserver.disconnect();
+        // Remove resize listener
+        window.removeEventListener('resize', this.setRootPosition.bind(this));
+        if (this.root && this.root.parentNode) {
+            this.root.remove();
+        }
+        // Clean up animation monitoring data
+        Inspector.clearAnimationStats();
+    }
+    destroyNode(id) {
+        const div = document.getElementById(id.toString());
+        if (div) {
+            div.node = null;
+            div.remove();
+        }
+    }
+    updateNodeProperty(div, property, 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    value, props) {
+        if (this.root === null || value === undefined) {
+            return;
+        }
+        if (property === 'w' || property === 'mountX' || property === 'mount') {
+            this.updateNodeProperty(div, 'x', props.x, props);
+        }
+        if (property === 'h' || property === 'mountY' || property === 'mount') {
+            this.updateNodeProperty(div, 'y', props.y, props);
+        }
+        /**
+         * Special case for parent property
+         */
+        if (property === 'parent') {
+            if (value) {
+                // detect if the parent is the root node
+                if (value.id === value.stage.root.id) {
+                    this.root.appendChild(div);
+                }
+                else {
+                    value.div.appendChild(div);
+                }
+            }
+            else {
+                div.parentNode?.removeChild(div);
+            }
+            return;
+        }
+        // special case for text
+        if (property === 'text') {
+            div.innerHTML = String(value);
+            // Keep DOM text invisible without breaking visibility checks
+            // Use very low opacity (0.001) instead of 0 so Playwright still detects it
+            div.style.opacity = '0.001';
+            div.style.pointerEvents = 'none';
+            div.style.userSelect = 'none';
+            return;
+        }
+        // special case for images
+        // we're not setting any CSS properties to avoid images getting loaded twice
+        // as the renderer will handle the loading of the image. Setting it to `data-src`
+        if (property === 'src' && value) {
+            div.setAttribute(`data-src`, String(value));
+            return;
+        }
+        // special case for color gradients (normal colors are handled by the stylePropertyMap)
+        // FIXME the renderer seems to return the same number for all colors
+        // if (gradientColorPropertyMap.includes(property as string)) {
+        //   const color = convertColorToRgba(value as number);
+        //   div.setAttribute(`data-${property}`, color);
+        //   return;
+        // }
+        if (property === 'rtt' && value) {
+            div.setAttribute('data-rtt', String(value));
+            return;
+        }
+        // CSS mappable attribute
+        if (stylePropertyMap[property]) {
+            const mappedStyleResponse = stylePropertyMap[property]?.(value);
+            if (typeof mappedStyleResponse === 'string') {
+                div.style.setProperty(mappedStyleResponse, String(value));
+                return;
+            }
+            if (typeof mappedStyleResponse === 'object') {
+                let value = mappedStyleResponse.value;
+                if (value === null) {
+                    div.style.removeProperty(mappedStyleResponse.prop);
+                    return;
+                }
+                if (property === 'x') {
+                    const mount = props.mountX;
+                    const width = props.w;
+                    if (mount) {
+                        value = `${parseInt(value) - width * mount}px`;
+                    }
+                }
+                else if (property === 'y') {
+                    const mount = props.mountY;
+                    const height = props.h;
+                    if (mount) {
+                        value = `${parseInt(value) - height * mount}px`;
+                    }
+                }
+                else if (mappedStyleResponse.prop === 'transform') {
+                    const rotation = props.rotation;
+                    const scaleX = props.scaleX;
+                    const scaleY = props.scaleY;
+                    if (rotation !== 0) {
+                        value = `rotate(${rotation}rad)`;
+                    }
+                    if (scaleX !== 1 || scaleY !== 1) {
+                        value += ` scale(${scaleX}, ${scaleY})`;
+                    }
+                    if (value === '') {
+                        div.style.removeProperty('transform');
+                        return;
+                    }
+                    value = value.trim();
+                }
+                div.style.setProperty(mappedStyleResponse.prop, value);
+            }
+            return;
+        }
+        // DOM properties
+        if (domPropertyMap[property]) {
+            const domProperty = domPropertyMap[property];
+            if (!domProperty) {
+                return;
+            }
+            div.setAttribute(String(domProperty), String(value));
+            return;
+        }
+        // custom data properties
+        if (property === 'data') {
+            for (const key in value) {
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+                const keyValue = value[key];
+                if (keyValue === undefined) {
+                    div.removeAttribute(`data-${key}`);
+                }
+                else {
+                    div.setAttribute(`data-${key}`, String(keyValue));
+                }
+            }
+            return;
+        }
+    }
+    updateViewport(width, height, deviceLogicalPixelRatio) {
+        this.scaleX = deviceLogicalPixelRatio ?? 1;
+        this.scaleY = deviceLogicalPixelRatio ?? 1;
+        this.width = width;
+        this.height = height;
+        this.setRootPosition();
+    }
+    // simple animation handler
+    animateNode(div, props, settings) {
+        const { duration = 1000, delay = 0,
+        // easing = 'linear',
+        // repeat = 0,
+        // loop = false,
+        // stopMethod = false,
+         } = settings;
+        const { x, y, w, h, alpha = 1, rotation = 0, scale = 1, color, mountX, mountY, } = props;
+        // ignoring loops and repeats for now, as that might be a bit too much for the inspector
+        function animate() {
+            setTimeout(() => {
+                div.style.top = `${y - h * mountY}px`;
+                div.style.left = `${x - w * mountX}px`;
+                div.style.width = `${w}px`;
+                div.style.height = `${h}px`;
+                div.style.opacity = `${alpha}`;
+                div.style.rotate = `${rotation}rad`;
+                div.style.scale = `${scale}`;
+                div.style.color = convertColorToRgba(color);
+            }, duration);
+        }
+        setTimeout(animate, delay);
+    }
+}
+//# sourceMappingURL=Inspector.js.map

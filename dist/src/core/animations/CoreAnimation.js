@@ -1,0 +1,306 @@
+/*
+ * If not stated otherwise in this file or this component's LICENSE file the
+ * following copyright and licenses apply:
+ *
+ * Copyright 2023 Comcast Cable Communications Management, LLC.
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import {} from '../CoreNode.js';
+import { getTimingFunction } from '../utils.js';
+import { mergeColorProgress } from '../../utils.js';
+import { EventEmitter } from '../../common/EventEmitter.js';
+import { reportLoopError, } from '../../common/loopError.js';
+let animationIdCounter = 0;
+export class CoreAnimation extends EventEmitter {
+    id = 0;
+    duration;
+    easing;
+    loop;
+    repeat;
+    stopMethod;
+    // Cached at init() time -- avoids re-computation in the per-frame hot path
+    hasEasing = false;
+    // Reciprocal of duration -- stored so update() multiplies instead of divides
+    invDuration = 0;
+    progress = 0;
+    delayFor = 0;
+    delay = 0;
+    timingFunction;
+    node;
+    // Index into AnimationManager.activeAnimations -- kept in sync on every
+    // register/swap-remove so unregisterAnimation() is O(1) with no indexOf scan.
+    activeIndex = -1;
+    // Persistent PropGroup instances -- reused across pool recycles to avoid
+    // allocating new arrays each time. length tracks how many entries are active.
+    propsGroup = {
+        keys: [],
+        starts: [],
+        targets: [],
+        isColor: [],
+        length: 0,
+    };
+    shaderPropsGroup = {
+        keys: [],
+        starts: [],
+        targets: [],
+        isColor: [],
+        length: 0,
+    };
+    // Fixed set of event names this animation emits -- used for zero-alloc clearListeners()
+    static EVENTS = [
+        'finished',
+        'animating',
+        'tick',
+        'destroyed',
+    ];
+    propValuesMap = { props: null, shaderProps: null };
+    constructor() {
+        super();
+    }
+    /**
+     * Error handler for app code fired from this animation (custom easing fns
+     * and finished/tick/animating/destroyed listeners).
+     */
+    getLoopErrorHandler() {
+        return this.node?.stage.platform.settings.handleLoopError;
+    }
+    /**
+     * Invoke the app-supplied easing function, falling back to `fallback` on throw.
+     *
+     * @remarks
+     * The `try` lives here — not in `update()`/`updateValue()` — so those hot
+     * functions stay `try`-free. No closure allocation (unlike a generic
+     * safe-call helper): direct call keeps per-prop-per-frame cost to one call.
+     */
+    applyEasing(progress, fallback, onError) {
+        try {
+            return this.timingFunction(progress);
+        }
+        catch (error) {
+            reportLoopError(error, onError);
+            return fallback;
+        }
+    }
+    /**
+     * Initialize (or reinitialize) this animation with new parameters.
+     * Called both on first use and when recycled from the pool.
+     */
+    init(node, props, settings) {
+        this.id = ++animationIdCounter;
+        this.node = node;
+        this.progress = 0;
+        this.activeIndex = -1;
+        this.propValuesMap.props = null;
+        this.propValuesMap.shaderProps = null;
+        // Reset persistent group lengths (reuse existing arrays, no new allocations)
+        this.propsGroup.length = 0;
+        this.shaderPropsGroup.length = 0;
+        for (const key in props) {
+            if (key !== 'shaderProps') {
+                if (this.propValuesMap['props'] === null) {
+                    this.propValuesMap['props'] = this.propsGroup;
+                }
+                const group = this.propsGroup;
+                const i = group.length++;
+                group.keys[i] = key;
+                group.starts[i] =
+                    node[key] || 0;
+                group.targets[i] = props[key];
+                group.isColor[i] = key.indexOf('color') !== -1;
+            }
+            else if (node.shader !== null) {
+                this.propValuesMap['shaderProps'] = this.shaderPropsGroup;
+                const group = this.shaderPropsGroup;
+                for (const key in props.shaderProps) {
+                    let start = node.shader.props[key];
+                    if (Array.isArray(start) === true) {
+                        start = start[0];
+                    }
+                    const i = group.length++;
+                    group.keys[i] = key;
+                    group.starts[i] = start;
+                    group.targets[i] = props.shaderProps[key];
+                    group.isColor[i] = key.indexOf('color') !== -1;
+                }
+            }
+        }
+        const easing = settings.easing || 'linear';
+        const delay = settings.delay ?? 0;
+        const duration = settings.duration ?? 0;
+        this.duration = duration;
+        // Pre-compute reciprocal to replace per-frame division with multiplication
+        this.invDuration = duration > 0 ? 1 / duration : 0;
+        this.delay = delay;
+        this.easing = easing;
+        this.loop = settings.loop ?? false;
+        this.repeat = settings.repeat ?? 0;
+        this.stopMethod = settings.stopMethod ?? false;
+        this.timingFunction =
+            typeof easing === 'string' ? getTimingFunction(easing) : easing;
+        // Explicit bool -- avoids string comparison on every updateValue() call
+        this.hasEasing = easing !== 'linear';
+        this.delayFor = delay;
+    }
+    release() {
+        this.clearListeners(CoreAnimation.EVENTS);
+        this.node = undefined;
+    }
+    reset() {
+        this.progress = 0;
+        this.delayFor = this.delay || 0;
+        // Write start values directly rather than calling update(0), which would
+        // run the full update pipeline (dirty marking, event emissions) for no gain.
+        // Identical visible behaviour -- node properties snap to start values.
+        const propsGroup = this.propValuesMap.props;
+        const shaderGroup = this.propValuesMap.shaderProps;
+        if (propsGroup !== null) {
+            this.restoreValues(this.node, propsGroup);
+        }
+        if (shaderGroup !== null) {
+            this.restoreValues(this.node.shader.props, shaderGroup);
+        }
+    }
+    restoreValues(target, group) {
+        const keys = group.keys;
+        const starts = group.starts;
+        const length = group.length;
+        for (let i = 0; i < length; i++) {
+            target[keys[i]] = starts[i];
+        }
+    }
+    restore() {
+        // reset() already writes start values back to node properties
+        this.reset();
+    }
+    reverseValues(group) {
+        const starts = group.starts;
+        const targets = group.targets;
+        const length = group.length;
+        for (let i = 0; i < length; i++) {
+            const tmp = starts[i];
+            starts[i] = targets[i];
+            targets[i] = tmp;
+        }
+    }
+    reverse() {
+        this.progress = 0;
+        if (this.propValuesMap['props'] !== null) {
+            this.reverseValues(this.propValuesMap['props']);
+        }
+        if (this.propValuesMap['shaderProps'] !== null) {
+            this.reverseValues(this.propValuesMap['shaderProps']);
+        }
+        // restore stop method if we are not looping
+        if (this.loop === false) {
+            this.stopMethod = false;
+        }
+    }
+    /**
+     * Interpolate a single property value given the current progress.
+     * progress is passed as a parameter so callers can cache it in a local,
+     * avoiding repeated this.progress reads (which box floats in V8).
+     */
+    updateValue(isColor, propValue, startValue, progress, onError) {
+        if (progress === 1) {
+            return propValue;
+        }
+        if (progress === 0) {
+            return startValue;
+        }
+        if (isColor === true) {
+            if (startValue === propValue) {
+                return startValue;
+            }
+            if (this.hasEasing === true) {
+                const p = this.applyEasing(progress, progress, onError) || progress;
+                return mergeColorProgress(startValue, propValue, p);
+            }
+            return mergeColorProgress(startValue, propValue, progress);
+        }
+        if (this.hasEasing === true) {
+            // Inlined applyEasing: this.timingFunction(p) * (e - s) + s
+            return (this.applyEasing(progress, progress, onError) *
+                (propValue - startValue) +
+                startValue);
+        }
+        return startValue + (propValue - startValue) * progress;
+    }
+    updateValues(target, group, progress, onError) {
+        const keys = group.keys;
+        const starts = group.starts;
+        const targets = group.targets;
+        const isColor = group.isColor;
+        const length = group.length;
+        for (let i = 0; i < length; i++) {
+            target[keys[i]] = this.updateValue(isColor[i], targets[i], starts[i], progress, onError);
+        }
+    }
+    update(dt) {
+        const node = this.node;
+        // Resolved once per update (a few property reads): app's error hook for
+        // every app entry point below (easing + all emits). `undefined` falls back
+        // to console.error inside emitSafe/reportLoopError — still isolated.
+        const onError = this.getLoopErrorHandler();
+        if (node.destroyed) {
+            this.emitSafe('destroyed', undefined, onError);
+            return;
+        }
+        if (this.delayFor > 0) {
+            this.delayFor -= dt;
+            if (this.delayFor > 0) {
+                return;
+            }
+            else {
+                // Preserve only the part of this frame that remained after the delay.
+                dt = -this.delayFor;
+                this.delayFor = 0;
+            }
+        }
+        // Read progress once into a local -- avoids repeated this.progress reads
+        // which cause V8 to box the float value on each access to the object property.
+        let progress = this.progress;
+        if (progress === 0) {
+            this.emitSafe('animating', undefined, onError);
+        }
+        // Multiply by pre-computed reciprocal -- avoids per-frame float division
+        progress = this.duration === 0 ? 1 : progress + dt * this.invDuration;
+        if (progress > 1) {
+            progress = this.loop === true ? 0 : 1;
+            this.delayFor = this.delay;
+            if (this.stopMethod !== false) {
+                this.progress = progress;
+                this.emitSafe('finished', undefined, onError);
+                return;
+            }
+        }
+        // Write back once
+        this.progress = progress;
+        // Extract to locals to avoid repeated property lookups in the hot path
+        const propsGroup = this.propValuesMap.props;
+        const shaderGroup = this.propValuesMap.shaderProps;
+        if (propsGroup !== null) {
+            this.updateValues(node, propsGroup, progress, onError);
+        }
+        if (shaderGroup !== null) {
+            this.updateValues(node.shader.props, shaderGroup, progress, onError);
+        }
+        if (progress < 1) {
+            this.emitSafe('tick', undefined, onError);
+        }
+        if (progress === 1) {
+            this.emitSafe('finished', undefined, onError);
+        }
+    }
+}
+//# sourceMappingURL=CoreAnimation.js.map
