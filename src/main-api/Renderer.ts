@@ -26,8 +26,8 @@ import { type CoreTextNodeProps } from '../core/CoreTextNode.js';
 import type { INode, INodeProps, ITextNode, ITextNodeProps } from './INode.js';
 import type { TextureMemoryManagerSettings } from '../core/TextureMemoryManager.js';
 import type { TextRenderer } from '../core/text-rendering/TextRenderer.js';
-import type { CanvasRenderer } from '../core/renderers/canvas/CanvasRenderer.js';
-import type { WebGlRenderer } from '../core/renderers/webgl/WebGlRenderer.js';
+import type { CoreRendererConstructor } from '../core/renderers/CoreRenderer.js';
+import type { HaltiRendererOptions } from '../core/renderers/halti/HaltiTypes.js';
 import type { Inspector, InspectorOptions } from './Inspector.js';
 import type {
   CoreShaderNode,
@@ -385,7 +385,15 @@ export type RendererMainSettings = RendererRuntimeSettings &
      * both CanvasTextRenderer and SdfTextRenderer for Text Rendering.
      *
      */
-    renderEngine: typeof CanvasRenderer | typeof WebGlRenderer;
+    renderEngine: CoreRendererConstructor;
+
+    /**
+     * Existing Halti/Gibbon runtime objects used by the experimental Halti
+     * renderer. The application remains responsible for initializing Halti.
+     *
+     * @defaultValue `null`
+     */
+    halti: HaltiRendererOptions | null;
 
     /**
      * Quad buffer size in bytes
@@ -590,6 +598,7 @@ export class RendererMain extends EventEmitter {
       inspector: settings.inspector ?? false,
       inspectorOptions: settings.inspectorOptions ?? {},
       renderEngine: settings.renderEngine,
+      halti: settings.halti ?? null,
       quadBufferSize: settings.quadBufferSize ?? 4 * 1024 * 1024,
       enableDirtyRepaints: settings.enableDirtyRepaints ?? true,
       contextRestoreTimeout: settings.contextRestoreTimeout ?? 10000,
@@ -644,6 +653,7 @@ export class RendererMain extends EventEmitter {
       fpsBoundaries: settings.fpsBoundaries,
       enableClear: settings.enableClear!,
       renderEngine: settings.renderEngine!,
+      halti: settings.halti!,
       textureMemory: resolvedTxSettings,
       eventBus: this,
       quadBufferSize: settings.quadBufferSize!,

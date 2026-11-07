@@ -1,7 +1,7 @@
 # Lightning 3 Renderer
 
 [![Build Status](https://github.com/lightning-js/renderer/actions/workflows/tests.yml/badge.svg)](https://github.com/lightning-js/renderer/actions)
-[![Tests Passing](https://img.shields.io/badge/tests-passing-brightgreen)]()
+[![Tests Passing](https://img.shields.io/badge/tests-passing-brightgreen)](<>)
 [![npm version](https://img.shields.io/npm/v/@lightningjs/renderer.svg)](https://www.npmjs.com/package/@lightningjs/renderer)
 [![Bundle Size](https://img.shields.io/bundlephobia/minzip/@lightningjs/renderer)](https://bundlephobia.com/package/@lightningjs/renderer)
 [![npm downloads](https://img.shields.io/npm/dm/@lightningjs/renderer.svg)](https://www.npmjs.com/package/@lightningjs/renderer)
@@ -68,6 +68,7 @@ For detailed setup instructions and development workflows, see [Getting Started]
 
 - **[Getting Started](./docs/GETTING-STARTED.md)** – Installation, build commands, development workflow
 - **[Platform Architecture](./docs/PLATFORMS.md)** – Understanding and selecting rendering platforms (WebGL, Canvas, legacy support)
+- **[Experimental Halti Renderer](./docs/HALTI-SPIKE.md)** – Fork spike mapping real Blits applications onto supplied Gibbon/Halti widgets
 - **[Font Loading](./docs/FONTS.md)** – Installing and using Canvas and SDF fonts
 - **[Browser Support](./BROWSERS.md)** – Detailed browser compatibility and feature matrix
 - **[Example Tests](./examples/README.md)** – Manual testing and visual examples

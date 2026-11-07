@@ -87,6 +87,11 @@ const platformMap = {
 (async () => {
   // See README.md for details on the supported URL params
   const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('app') === 'blits-halti') {
+    await import('./blits-halti.js');
+    return;
+  }
+
   const automation = urlParams.get('automation') === 'true';
   /**
    * In automation mode this is a wildcard string of tests to run.

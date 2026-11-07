@@ -29,8 +29,10 @@ export interface BufferInfo {
   totalAvailable: number;
 }
 
+export type CoreRendererConstructor = new (stage: Stage) => CoreRenderer;
+
 export abstract class CoreRenderer {
-  public mode: 'webgl' | 'canvas' | undefined;
+  public mode: 'webgl' | 'canvas' | 'halti' | undefined;
   defaultTextureCoords: TextureCoords | undefined = undefined;
   readonly stage: Stage;
 
