@@ -21,7 +21,11 @@ import type { Dimensions } from '../../../common/CommonTypes.js';
 import { hasImageBitmap } from '../../platforms/capabilities.js';
 import type { TextureMemoryManager } from '../../TextureMemoryManager.js';
 import type { SubTexture } from '../../textures/SubTexture.js';
-import type { Texture, TextureData } from '../../textures/Texture.js';
+import {
+  TextureType,
+  type Texture,
+  type TextureData,
+} from '../../textures/Texture.js';
 import { CoreContextTexture } from '../CoreContextTexture.js';
 import type { HaltiImageSourceRect } from './HaltiTypes.js';
 import { rgbaToCssHex } from './internal/RendererUtils.js';
@@ -64,6 +68,7 @@ export class HaltiContextTexture extends CoreContextTexture {
 
     try {
       this.capture(textureData.data);
+      this.captureDirectImageSource();
       this.state = 'loaded';
       this.textureSource.setState('loaded', this.dimensions);
       this.textureSource.freeTextureData();
@@ -115,6 +120,23 @@ export class HaltiContextTexture extends CoreContextTexture {
       this.baseUrl = this.canvas.toDataURL('image/png');
     }
     return this.baseUrl;
+  }
+
+  private captureDirectImageSource(): void {
+    if (this.textureSource.type !== TextureType.image) return;
+
+    const props = (
+      this.textureSource as unknown as {
+        props?: { src?: unknown; w?: number | null; h?: number | null };
+      }
+    ).props;
+    if (typeof props?.src !== 'string' || props.src.length === 0) return;
+
+    this.directUrl = props.src;
+    this.dimensions = {
+      w: Math.max(1, props.w ?? this.dimensions.w),
+      h: Math.max(1, props.h ?? this.dimensions.h),
+    };
   }
 
   private capture(data: TextureData['data']): void {
